@@ -1,22 +1,316 @@
-<!DOCTYPE html>
-<html>
+<!doctype html>
+<html lang="en">
 <head>
-<meta charset="utf-8">
-<title>Public Proxy</title>
+  <meta charset="UTF-8" />
+  <title>Private URL (E2E Encrypted)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: system-ui, sans-serif; padding: 16px; }
+    input, button { font-size: 16px; padding: 10px; }
+    input { width: 100%; box-sizing: border-box; margin-bottom: 10px; }
+    pre { white-space: pre-wrap; word-break: break-word; background:#111; color:#eee; padding:12px; border-radius:10px; }
+    iframe { width: 100%; height: 70vh; border: 1px solid #ccc; border-radius: 8px; margin-top: 12px; }
+  </style>
 </head>
 <body>
-<h1>Public Proxy</h1>
-<input id="url" placeholder="Enter URL" style="width:70%">
-<button onclick="openProxy()">Load</button>
-<iframe id="proxyFrame" style="width:100%;height:80vh;"></iframe>
+  <h2>Private URL Fetch (Encrypted both ways)</h2>
+  <input id="url" placeholder="https://example.com" />
+  <button id="go">Fetch privately</button>
+  <iframe id="frame" sandbox="allow-scripts allow-forms"></iframe>
+  <div id="links"></div>
+  <pre id="out">Idle…</pre>
 
 <script>
-function openProxy(){
-  const url = document.getElementById('url').value;
-  if(!url) return alert('Enter a URL');
-  const workerURL = `https://hi.sebmojheh.workers.dev/?url=${encodeURIComponent(url)}`;
-  document.getElementById('proxyFrame').src = workerURL;
-}
+  const WORKER_BASE = "https://private-render.modmojheh.workers.dev";
+
+  const enc = new TextEncoder();
+  const dec = new TextDecoder();
+  let inFlight = false;
+
+  function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  function renderLinks(links) {
+    const box = document.getElementById("links");
+    if (!links || !links.length) {
+      box.innerHTML = "";
+      return;
+    }
+    const items = links.slice(0, 20).map(href => `<button class="link-btn" data-href="${href}">${href}</button>`).join(" ");
+    box.innerHTML = `<p>Links found (click to fetch via Worker):</p><div>${items}</div>`;
+    box.querySelectorAll("button.link-btn").forEach(btn => {
+      btn.onclick = () => {
+        run(btn.dataset.href).catch(e => {
+          document.getElementById("out").textContent = "Error: " + (e && e.message ? e.message : String(e));
+        });
+      };
+    });
+  }
+
+  function b64uEncode(bytes) {
+    let str = "";
+    for (const b of bytes) str += String.fromCharCode(b);
+    return btoa(str).replaceAll("+","-").replaceAll("/","_").replaceAll("=","");
+  }
+
+  function b64uDecode(s) {
+    s = s.replaceAll("-","+").replaceAll("_","/");
+    const pad = s.length % 4;
+    if (pad) s += "=".repeat(4 - pad);
+    const bin = atob(s);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  function concatBytes(a, b) {
+    const out = new Uint8Array(a.length + b.length);
+    out.set(a, 0);
+    out.set(b, a.length);
+    return out;
+  }
+
+  async function deriveAesKey(clientPrivateKey, serverPublicJwk, saltBytes) {
+    const serverPubKey = await crypto.subtle.importKey(
+      "jwk",
+      serverPublicJwk,
+      { name: "ECDH", namedCurve: "P-256" },
+      false,
+      []
+    );
+
+    // 256-bit shared secret from ECDH
+    const sharedBits = await crypto.subtle.deriveBits(
+      { name: "ECDH", public: serverPubKey },
+      clientPrivateKey,
+      256
+    );
+
+    // HKDF -> AES-GCM key
+    const hkdfKey = await crypto.subtle.importKey(
+      "raw",
+      sharedBits,
+      "HKDF",
+      false,
+      ["deriveKey"]
+    );
+
+    return crypto.subtle.deriveKey(
+      { name: "HKDF", hash: "SHA-256", salt: saltBytes, info: enc.encode("chatra-e2e-v1") },
+      hkdfKey,
+      { name: "AES-GCM", length: 256 },
+      false,
+      ["encrypt", "decrypt"]
+    );
+  }
+
+  async function aesEncrypt(aesKey, plaintextUtf8, aadUtf8) {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv, additionalData: enc.encode(aadUtf8) },
+      aesKey,
+      enc.encode(plaintextUtf8)
+    );
+    return { iv, data: new Uint8Array(ct) };
+  }
+
+  async function aesDecrypt(aesKey, ivBytes, dataBytes, aadUtf8) {
+    const pt = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: ivBytes, additionalData: enc.encode(aadUtf8) },
+      aesKey,
+      dataBytes
+    );
+    return dec.decode(pt);
+  }
+
+  async function run(urlOverride) {
+    if (inFlight) return;
+    inFlight = true;
+    const goBtn = document.getElementById("go");
+    goBtn.disabled = true;
+    const out = document.getElementById("out");
+    out.textContent = "Handshaking…";
+
+    // 1) Get server public key + token (no secrets here)
+    const hsRes = await fetch(`${WORKER_BASE}/handshake`, { method: "GET" });
+    if (!hsRes.ok) throw new Error("Handshake failed: " + hsRes.status);
+    const hs = await hsRes.json();
+    const serverPubJwk = hs.serverPublicJwk;
+    const serverNonce = b64uDecode(hs.serverNonceB64);
+    const issuedAt = hs.issuedAt;
+    const tokenB64 = hs.tokenB64;
+
+    // 2) Browser makes ephemeral ECDH keypair (private never leaves the browser)
+    const clientKeys = await crypto.subtle.generateKey(
+      { name: "ECDH", namedCurve: "P-256" },
+      false,
+      ["deriveBits"]
+    );
+    const clientPublicJwk = await crypto.subtle.exportKey("jwk", clientKeys.publicKey);
+
+    // 3) Derive session AES key (salt = serverNonce || clientNonce)
+    const clientNonce = crypto.getRandomValues(new Uint8Array(16));
+    const salt = concatBytes(serverNonce, clientNonce);
+    const aesKey = await deriveAesKey(clientKeys.privateKey, serverPubJwk, salt);
+
+    // 4) Encrypt URL request
+    const urlInput = document.getElementById("url");
+    const url = (urlOverride ?? urlInput.value).trim();
+    if (!urlOverride) urlInput.value = url; // sync field when triggered from iframe link
+    if (!url) {
+      throw new Error("Enter an https:// URL");
+    }
+    if (!url.toLowerCase().startsWith("https://")) {
+      throw new Error("Only https:// URLs are allowed");
+    }
+    const aad = `v1|${issuedAt}|${b64uEncode(serverNonce)}|${b64uEncode(clientNonce)}`;
+
+    out.textContent = "Encrypting + sending…";
+
+    const encReq = await aesEncrypt(
+      aesKey,
+      JSON.stringify({ url, ts: Date.now() }),
+      aad
+    );
+
+    const payload = {
+      v: 1,
+      tokenB64,
+      issuedAt,
+      serverNonceB64: b64uEncode(serverNonce),
+      clientNonceB64: b64uEncode(clientNonce),
+      clientPublicJwk,
+      ivB64: b64uEncode(encReq.iv),
+      dataB64: b64uEncode(encReq.data)
+    };
+
+    async function sendWithRetry() {
+      const maxAttempts = 3;
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        const res = await fetch(`${WORKER_BASE}/render`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+
+        let encResp;
+        try {
+          encResp = await res.json();
+        } catch {
+          const t = await res.text().catch(() => "");
+          throw new Error(`Worker returned non-JSON (${res.status}): ${t || "(empty)"}`);
+        }
+
+        if (res.status === 429 && attempt < maxAttempts - 1) {
+          const delay = 500 * Math.pow(2, attempt) + Math.random() * 200;
+          out.textContent = `Rate limited (429). Retrying in ${Math.round(delay)} ms…`;
+          await sleep(delay);
+          continue;
+        }
+
+        if (!res.ok) {
+          if (encResp && encResp.ivB64 && encResp.dataB64) {
+            try {
+              const errPlaintext = await aesDecrypt(
+                aesKey,
+                b64uDecode(encResp.ivB64),
+                b64uDecode(encResp.dataB64),
+                aad
+              );
+              try {
+                const errObj = JSON.parse(errPlaintext);
+                throw new Error(errObj.error || errPlaintext);
+              } catch {
+                throw new Error(errPlaintext);
+              }
+            } catch {
+              // If decrypt fails, fall through to plaintext/generic message.
+            }
+          }
+          throw new Error(encResp.error || (`Worker error: ${res.status}`));
+        }
+
+        return encResp;
+      }
+      throw new Error("Rate limited; please try again in a moment");
+    }
+
+    const encResp = await sendWithRetry();
+
+    const respAad = aad; // same AAD string
+    const plaintext = await aesDecrypt(
+      aesKey,
+      b64uDecode(encResp.ivB64),
+      b64uDecode(encResp.dataB64),
+      respAad
+    );
+
+    const obj = JSON.parse(plaintext);
+
+    // Extract links from returned HTML for out-of-iframe navigation
+    try {
+      if (obj.html) {
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(obj.html, "text/html");
+        const anchors = Array.from(doc.querySelectorAll("a[href]"));
+        const unique = new Set();
+        const resolved = [];
+        anchors.forEach(a => {
+          try {
+            const href = new URL(a.getAttribute("href"), obj.finalUrl || url).toString();
+            if (!href.toLowerCase().startsWith("https://")) return;
+            if (unique.has(href)) return;
+            unique.add(href);
+            resolved.push(href);
+          } catch { /* ignore bad URLs */ }
+        });
+        renderLinks(resolved);
+      } else {
+        renderLinks([]);
+      }
+    } catch {
+      renderLinks([]);
+    }
+
+    // Render HTML in iframe if available
+    const frame = document.getElementById("frame");
+    if (obj.html) {
+      const baseTag = obj.finalUrl ? `<base href="${obj.finalUrl}">` : "";
+      const hasBase = /<base\b/i.test(obj.html);
+      const htmlWithBase = hasBase
+        ? obj.html
+        : obj.html.replace(/<head([^>]*)>/i, `<head$1>${baseTag}`);
+      const navHelper = `\n<script>\n  window.addEventListener('click', (e) => {\n    const a = e.target.closest('a');\n    if (!a || !a.href) return;\n    e.preventDefault();\n    window.parent.postMessage({ type: 'navigate', href: a.href }, '*');\n  });\n<\/script>`;
+      frame.srcdoc = htmlWithBase + navHelper;
+    } else {
+      frame.srcdoc = "<p>No HTML returned.</p>";
+    }
+
+    out.textContent = JSON.stringify(obj, null, 2);
+    goBtn.disabled = false;
+    inFlight = false;
+  }
+
+  document.getElementById("go").addEventListener("click", () => {
+    run().catch(e => {
+      document.getElementById("out").textContent = "Error: " + (e && e.message ? e.message : String(e));
+      document.getElementById("go").disabled = false;
+      inFlight = false;
+    });
+  });
+
+  // Allow clicking links inside rendered iframe to trigger new fetch via Worker
+  window.addEventListener("message", (event) => {
+    const data = event.data;
+    if (data && data.type === "navigate" && typeof data.href === "string") {
+      run(data.href).catch(e => {
+        document.getElementById("out").textContent = "Error: " + (e && e.message ? e.message : String(e));
+        document.getElementById("go").disabled = false;
+        inFlight = false;
+      });
+    }
+  });
 </script>
 </body>
 </html>
