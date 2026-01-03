@@ -11,12 +11,50 @@ const https = require('https');
 const http = require('http');
 const path = require('path');
 
+// ============================================================================
+// DEBUG LOGGING SYSTEM - Comprehensive debugging for all operations
+// ============================================================================
+
+const DEBUG_CATEGORIES = {
+  REQUEST: true,     // Incoming requests
+  PROXY: true,       // Proxy operations
+  TOKEN: true,       // Token creation/resolution
+  SESSION: true,     // Session operations
+  HTML: true,        // HTML rewriting
+  FETCH: true,       // Upstream fetches
+  ERROR: true,       // All errors
+  CACHE: true,       // Caching operations
+  STREAM: true       // Video/audio streaming
+};
+
+function debug(category, message, data = {}) {
+  if (DEBUG_CATEGORIES[category] || DEBUG_CATEGORIES.ALL) {
+    const timestamp = new Date().toISOString();
+    console.log(`[${timestamp}][${category}] ${message}`, Object.keys(data).length > 0 ? JSON.stringify(data, null, 2) : '');
+  }
+}
+
+function debugError(category, message, error, data = {}) {
+  const timestamp = new Date().toISOString();
+  console.error(`[${timestamp}][${category}] ❌ ${message}`, {
+    error: error?.message || String(error),
+    stack: error?.stack?.split('\n').slice(0, 5).join('\n'),
+    code: error?.code,
+    ...data
+  });
+}
+
+function debugWarn(category, message, data = {}) {
+  const timestamp = new Date().toISOString();
+  console.warn(`[${timestamp}][${category}] ⚠️ ${message}`, JSON.stringify(data, null, 2));
+}
+
 // Global uncaught exception/rejection handlers to keep server running
 process.on('uncaughtException', (err) => {
-  console.error('[FATAL] Uncaught exception (server continuing):', err.message);
+  debugError('FATAL', 'Uncaught exception (server continuing)', err);
 });
 process.on('unhandledRejection', (reason) => {
-  console.error('[FATAL] Unhandled rejection (server continuing):', reason);
+  debugError('FATAL', 'Unhandled rejection (server continuing)', reason);
 });
 
 // Import modules
@@ -73,22 +111,26 @@ const config = {
 const DEBUG = process.env.DEBUG === 'true' || true; // Enable by default for now
 
 function debugLog(...args) {
-  if (DEBUG) console.log('[DEBUG]', new Date().toISOString(), ...args);
+  if (DEBUG) debug('LEGACY', args.join(' '));
 }
 
 function errorLog(...args) {
-  console.error('[ERROR]', new Date().toISOString(), ...args);
+  debugError('LEGACY', args.join(' '), null);
 }
 
 function warnLog(...args) {
-  console.warn('[WARN]', new Date().toISOString(), ...args);
+  debugWarn('LEGACY', args.join(' '));
 }
 
 // Debug: print configured origins for troubleshooting
-console.log('[Config] allowedOrigin=', config.allowedOrigin);
-console.log('[Config] additionalOrigins=', config.additionalOrigins);
-console.log('[Config] allowAny=', config.allowAny);
-console.log('[Config] DEBUG=', DEBUG);
+debug('CONFIG', 'Server configuration loaded', {
+  allowedOrigin: config.allowedOrigin,
+  additionalOrigins: config.additionalOrigins,
+  allowAny: config.allowAny,
+  port: config.port,
+  tokenTTL: config.tokenTTL,
+  sessionTTL: config.sessionTTL
+});
 
 // ============================================================================
 // Initialize Services
@@ -360,6 +402,13 @@ app.use((req, res, next) => {
 // ============================================================================
 
 function authMiddleware(req, res, next) {
+  debug('SESSION', 'Auth middleware invoked', { 
+    path: req.path,
+    method: req.method,
+    hasAuthHeader: !!req.headers.authorization,
+    hasSessionHeader: !!req.headers['x-session-token']
+  });
+  
   // Support multiple ways to provide the session token:
   //  - Authorization: Bearer <token>
   //  - X-Session-Token: <token>
@@ -368,19 +417,31 @@ function authMiddleware(req, res, next) {
   const authHeader = req.headers.authorization;
   if (authHeader && authHeader.startsWith('Bearer ')) {
     sessionToken = authHeader.slice(7);
+    debug('SESSION', 'Token from Authorization header', { tokenPreview: sessionToken?.substring(0, 12) + '...' });
   } else if (req.headers['x-session-token']) {
     sessionToken = req.headers['x-session-token'];
+    debug('SESSION', 'Token from X-Session-Token header', { tokenPreview: sessionToken?.substring(0, 12) + '...' });
   } else if (req.body && req.body.sessionToken) {
     sessionToken = req.body.sessionToken;
+    debug('SESSION', 'Token from body', { tokenPreview: sessionToken?.substring(0, 12) + '...' });
   }
   
   if (!sessionToken) {
-    return res.status(401).json({ error: 'Missing or invalid session token' });
+    debug('SESSION', 'NO SESSION TOKEN FOUND - rejecting request', { 
+      path: req.path, 
+      headers: Object.keys(req.headers).join(', ')
+    });
+    return res.status(401).json({ 
+      error: 'Missing or invalid session token',
+      details: 'No session token found in Authorization header, X-Session-Token header, or request body',
+      hint: 'Create a session first with POST /session, then include the token'
+    });
   }
   const ip = req.ip || req.connection.remoteAddress;
   // Allow a special anonymous token to facilitate bootstrap tokenization
   // for rewritten pages that do not have an explicit client session.
   if (sessionToken === 'anonymous') {
+    debug('SESSION', 'Anonymous session allowed');
     req.sessionId = 'anonymous';
     req.sessionData = { anonymous: true };
     return next();
@@ -389,9 +450,24 @@ function authMiddleware(req, res, next) {
   const result = sessionStore.validateSession(sessionToken, ip);
 
   if (!result.valid) {
+    debugWarn('SESSION', 'Session validation FAILED', { 
+      reason: result.reason,
+      tokenPreview: sessionToken?.substring(0, 12) + '...',
+      ip,
+      path: req.path
+    });
     securityLogger.logBlocked('AUTH', result.reason, { ip, path: req.path });
-    return res.status(401).json({ error: result.reason });
+    return res.status(401).json({ 
+      error: result.reason,
+      details: 'Session validation failed - session may have expired or be invalid',
+      hint: 'Create a new session with POST /session'
+    });
   }
+  
+  debug('SESSION', 'Session validated successfully', { 
+    tokenPreview: sessionToken?.substring(0, 12) + '...',
+    ip
+  });
   
   // Attach session info to request
   req.sessionId = sessionToken;
@@ -429,13 +505,28 @@ app.post('/session', rateLimiter.middleware('request'), (req, res) => {
   const ip = req.ip || req.connection.remoteAddress;
   const userAgent = req.headers['user-agent'] || '';
   
-  const { sessionToken, expiresIn } = sessionStore.createSession(ip, userAgent);
+  debug('SESSION', 'Creating new session', { ip, userAgent: userAgent?.substring(0, 50) });
   
-  res.json({
-    sessionToken,
-    expiresIn,
-    expiresAt: new Date(Date.now() + expiresIn).toISOString()
-  });
+  try {
+    const { sessionToken, expiresIn } = sessionStore.createSession(ip, userAgent);
+    
+    debug('SESSION', 'Session created successfully', { 
+      tokenPreview: sessionToken?.substring(0, 12) + '...',
+      expiresIn
+    });
+    
+    res.json({
+      sessionToken,
+      expiresIn,
+      expiresAt: new Date(Date.now() + expiresIn).toISOString()
+    });
+  } catch (e) {
+    debugError('SESSION', 'Failed to create session', e, { ip });
+    res.status(500).json({ 
+      error: 'Failed to create session',
+      details: e.message
+    });
+  }
 });
 
 /**
@@ -445,28 +536,28 @@ app.post('/session', rateLimiter.middleware('request'), (req, res) => {
  */
 app.post('/tokenize', authMiddleware, rateLimiter.middleware('token'), async (req, res) => {
   const { url } = req.body;
-  const reqId = req.reqId || 'unknown';
+  const reqId = req.reqId || Math.random().toString(36).substring(7);
   
-  console.log(`\n========== TOKENIZE REQUEST [${reqId}] ==========`);
-  console.log(`[${reqId}] URL:`, url ? url.substring(0, 120) : 'MISSING');
-  console.log(`[${reqId}] Session:`, req.sessionId ? (req.sessionId === 'anonymous' ? 'ANONYMOUS' : '...' + req.sessionId.slice(-8)) : 'NONE');
-  console.log(`[${reqId}] Request headers:`, JSON.stringify({
-    authorization: req.headers.authorization ? 'Bearer ...' + req.headers.authorization.slice(-8) : null,
-    'x-parent-token': req.headers['x-parent-token'] ? '...' + req.headers['x-parent-token'].slice(-8) : null,
-    origin: req.headers.origin,
-    referer: req.headers.referer ? req.headers.referer.substring(0, 80) : null
-  }, null, 2));
+  debug('TOKEN', `========== TOKENIZE REQUEST [${reqId}] ==========`, {
+    url: url?.substring(0, 120),
+    session: req.sessionId === 'anonymous' ? 'ANONYMOUS' : req.sessionId?.substring(0, 12) + '...',
+    hasParentToken: !!(req.headers['x-parent-token'] || req.body.parentToken)
+  });
   
   if (!url || typeof url !== 'string') {
-    warnLog(`[${reqId}] /tokenize missing url parameter`);
-    return res.status(400).json({ error: 'Missing or invalid url parameter' });
+    debugWarn('TOKEN', 'Missing url parameter', { reqId });
+    return res.status(400).json({ 
+      error: 'Missing or invalid url parameter',
+      details: 'The "url" field is required in the request body',
+      received: typeof url
+    });
   }
   
   // Resolve relative URLs if base URL provided
   let targetUrl = url;
   if (req.body.baseUrl) {
     targetUrl = resolveUrl(url, req.body.baseUrl) || url;
-    console.log(`[${reqId}] Resolved relative URL to:`, targetUrl.substring(0, 100));
+    debug('TOKEN', `Resolved relative URL`, { original: url?.substring(0, 80), resolved: targetUrl?.substring(0, 100) });
   }
   
   // Validate URL. If the request is authenticated with a real session
@@ -477,49 +568,50 @@ app.post('/tokenize', authMiddleware, rateLimiter.middleware('token'), async (re
   let validation;
   // Allow anonymous bootstrap tokenize if a valid parent token is provided
   const parentTokenHeader = (req.headers['x-parent-token'] || req.body.parentToken || '').toString();
-  console.log(`[${reqId}] Parent token:`, parentTokenHeader ? 'YES (...' + parentTokenHeader.slice(-12) + ')' : 'NONE');
   
   if (req.sessionId === 'anonymous' && parentTokenHeader) {
     // Resolve the parent token and allow tokenization for same-origin resources
-    console.log(`[${reqId}] VALIDATION PATH: Anonymous + Parent Token`);
+    debug('TOKEN', 'VALIDATION PATH: Anonymous + Parent Token', { reqId, parentToken: parentTokenHeader?.substring(0, 12) + '...' });
     const parentRes = tokenStore.resolveToken(parentTokenHeader, null);
-    console.log(`[${reqId}] Parent token resolution:`, parentRes ? { valid: parentRes.valid, url: parentRes.url ? parentRes.url.substring(0, 80) : null, reason: parentRes.reason || 'OK' } : 'NULL');
     
     if (parentRes && parentRes.valid) {
       try {
         const tu = new URL(targetUrl);
         const pu = new URL(parentRes.url);
-        console.log(`[${reqId}] Origin comparison:`);
-        console.log(`[${reqId}]   Target: ${tu.origin}`);
-        console.log(`[${reqId}]   Parent: ${pu.origin}`);
-        console.log(`[${reqId}]   Match: ${tu.origin === pu.origin}`);
+        
+        debug('TOKEN', 'Origin comparison', {
+          targetOrigin: tu.origin,
+          parentOrigin: pu.origin,
+          match: tu.origin === pu.origin
+        });
         
         // ENHANCED: Allow any public http(s) URL when allowAny is enabled
         if ((tu.protocol === 'http:' || tu.protocol === 'https:')) {
           if (tu.origin === pu.origin) {
             validation = { valid: true, url: tu };
-            console.log(`[${reqId}] ✓ Same-origin anonymous tokenize ALLOWED`);
+            debug('TOKEN', '✓ Same-origin anonymous tokenize ALLOWED', { reqId });
           } else if (config.allowAny) {
             // allowAny mode: allow cross-origin from anonymous bootstrap
             validation = { valid: true, url: tu };
-            console.log(`[${reqId}] ✓ Cross-origin anonymous tokenize ALLOWED (allowAny=true)`);
+            debug('TOKEN', '✓ Cross-origin anonymous tokenize ALLOWED (allowAny=true)', { reqId, targetOrigin: tu.origin });
           } else {
             validation = { valid: false, reason: `Origin mismatch: ${tu.origin} vs ${pu.origin}` };
-            console.log(`[${reqId}] ✗ Origin mismatch BLOCKED`);
+            debugWarn('TOKEN', 'Origin mismatch BLOCKED', { reqId, targetOrigin: tu.origin, parentOrigin: pu.origin });
           }
         } else {
           validation = { valid: false, reason: `Unsupported protocol: ${tu.protocol}` };
+          debugWarn('TOKEN', 'Unsupported protocol', { reqId, protocol: tu.protocol });
         }
       } catch (e) {
         validation = { valid: false, reason: 'Invalid URL format: ' + e.message };
-        console.log(`[${reqId}] ✗ Invalid URL format:`, e.message);
+        debugError('TOKEN', 'Invalid URL format', e, { reqId, url: targetUrl?.substring(0, 100) });
       }
     } else {
-      validation = { valid: false, reason: 'Invalid parent token' };
-      console.log(`[${reqId}] ✗ Invalid parent token`);
+      validation = { valid: false, reason: `Invalid parent token: ${parentRes?.reason || 'unknown'}` };
+      debugWarn('TOKEN', 'Invalid parent token', { reqId, reason: parentRes?.reason });
     }
   } else if (req.sessionId && req.sessionId !== 'anonymous') {
-    console.log(`[${reqId}] VALIDATION PATH: Real Session`);
+    debug('TOKEN', 'VALIDATION PATH: Real Session', { reqId });
     try {
       const u = new URL(targetUrl);
       if (u.protocol === 'http:' || u.protocol === 'https:') {
@@ -543,27 +635,41 @@ app.post('/tokenize', authMiddleware, rateLimiter.middleware('token'), async (re
     console.log(`[${reqId}] DNS validation result:`, { valid: validation.valid, reason: validation.reason || 'OK' });
   }
   
-  console.log(`[${reqId}] FINAL VALIDATION:`, { valid: validation.valid, reason: validation.reason || 'OK' });
-  console.log(`========== END TOKENIZE [${reqId}] ==========\n`);
+  debug('TOKEN', 'FINAL VALIDATION', { reqId, valid: validation.valid, reason: validation.reason || 'OK' });
   
   if (!validation.valid) {
     if (validation.passthrough) {
-      console.log(`[${reqId}] Passthrough URL (mailto/tel/etc)`);
+      debug('TOKEN', 'Passthrough URL (mailto/tel/etc)', { reqId, url: targetUrl });
       return res.json({ token: null, passthrough: true, url: targetUrl });
     }
     
-    console.log(`[${reqId}] /tokenize BLOCKED: ${validation.reason} for URL: ${targetUrl.substring(0, 100)}`);
+    debugWarn('TOKEN', 'TOKENIZE BLOCKED', { 
+      reqId, 
+      reason: validation.reason, 
+      url: targetUrl?.substring(0, 100),
+      sessionId: req.sessionId === 'anonymous' ? 'anonymous' : req.sessionId?.substring(0, 12) + '...'
+    });
     securityLogger.logBlocked('TOKENIZE', validation.reason, {
       url: targetUrl,
       sessionId: req.sessionId
     });
     
-    return res.status(403).type('text/plain').send(`URL not allowed: ${validation.reason}`);
+    return res.status(403).json({ 
+      error: 'URL not allowed',
+      reason: validation.reason,
+      url: targetUrl?.substring(0, 100),
+      hint: 'Check that the URL is a valid http/https URL and matches origin restrictions'
+    });
   }
   
   try {
     const { token, cached } = tokenStore.createToken(targetUrl, req.sessionId);
-    console.log(`[${reqId}] ✓ Token created:`, { token: '...' + token.slice(-12), cached, url: targetUrl.substring(0, 60) });
+    debug('TOKEN', '✓ Token created', { 
+      reqId, 
+      tokenPreview: token?.substring(0, 12) + '...', 
+      cached, 
+      url: targetUrl?.substring(0, 60) 
+    });
     
     res.json({
       token,
@@ -571,9 +677,13 @@ app.post('/tokenize', authMiddleware, rateLimiter.middleware('token'), async (re
       gatewayUrl: `/go/${token}`
     });
   } catch (e) {
-    console.log(`[${reqId}] ✗ Token creation failed:`, e.message);
+    debugError('TOKEN', 'Token creation failed', e, { reqId, url: targetUrl?.substring(0, 100) });
     securityLogger.logWarning('Token creation failed', { error: e.message });
-    res.status(429).json({ error: e.message });
+    res.status(429).json({ 
+      error: 'Token creation failed',
+      details: e.message,
+      hint: 'This may be due to rate limiting or internal errors'
+    });
   }
 });
 
@@ -774,13 +884,25 @@ app.all('/go/:token', rateLimiter.middleware('proxy'), async (req, res) => {
   const ip = req.ip || req.connection.remoteAddress;
   const reqId = req.reqId || Math.random().toString(36).substring(2, 8);
   
-  debugLog(`[${reqId}] /go/:token called, token: ...${token.slice(-12)}`);
+  debug('PROXY', `========== GATEWAY REQUEST [${reqId}] ==========`, {
+    token: token?.substring(0, 12) + '...',
+    method: req.method,
+    ip,
+    accept: req.get('accept')?.substring(0, 50),
+    secFetchDest: req.get('sec-fetch-dest'),
+    secFetchMode: req.get('sec-fetch-mode'),
+    referer: req.get('referer')?.substring(0, 80)
+  });
   
   // Detect if this looks like a file path rather than a token (e.g., core.js, styles.css)
   // Valid tokens are base64url encoded and typically ~43 chars without dots/extensions
   const looksLikeFile = /\.(js|css|json|html|png|jpg|jpeg|gif|svg|woff2?|ttf|eot|ico|mp[34]|webm|wav|pdf|map|xml)(\?|$)/i.test(token);
   if (looksLikeFile) {
-    warnLog(`[${reqId}] /go/:token looks like file path, not token: ${token.substring(0, 50)}`);
+    debugWarn('PROXY', 'Token looks like file path, not a valid token', { 
+      reqId, 
+      token: token?.substring(0, 50),
+      hint: 'This URL was not tokenized - check the HTML rewriting'
+    });
     // This is likely a relative path that wasn't tokenized - return MIME-appropriate error
     const ext = (token.match(/\.([a-z0-9]+)(\?|$)/i) || [])[1] || '';
     const mimeMap = {
@@ -799,20 +921,30 @@ app.all('/go/:token', rateLimiter.middleware('proxy'), async (req, res) => {
     return res.status(404).send('');
   }
   
-  debugLog(`[${reqId}] /go resolving token...`);
+  debug('PROXY', 'Resolving token', { reqId, tokenPreview: token?.substring(0, 12) + '...' });
   
   // Resolve token (no session validation needed - token is the auth)
   const resolution = tokenStore.resolveToken(token, null);
   
-  debugLog(`[${reqId}] Token resolution:`, { 
+  debug('PROXY', 'Token resolution result', { 
+    reqId,
     valid: resolution.valid, 
     reason: resolution.reason || 'OK',
-    url: resolution.url ? resolution.url.substring(0, 80) : null
+    url: resolution.url?.substring(0, 80)
   });
   
   if (!resolution.valid) {
-    warnLog(`[${reqId}] Token invalid: ${resolution.reason}, token: ...${token.slice(-12)}`);
+    debugWarn('PROXY', 'TOKEN INVALID', {
+      reqId,
+      reason: resolution.reason,
+      tokenPreview: token?.substring(0, 16) + '...',
+      ip,
+      acceptHeader: req.get('accept')?.substring(0, 50),
+      referer: req.get('referer')?.substring(0, 80),
+      hint: 'Token may have expired (1 hour TTL) or never existed'
+    });
     securityLogger.logBlocked('TOKEN', resolution.reason, { token: token.slice(0, 8) + '...', ip });
+    
     // Return a MIME-appropriate error so browsers don't reject scripts/styles
     const acceptHeader = req.get('accept') || '';
     const referer = req.get('referer') || '';
@@ -841,28 +973,51 @@ app.all('/go/:token', rateLimiter.middleware('proxy'), async (req, res) => {
   }
   
   const targetUrl = resolution.url;
-  debugLog(`[${reqId}] Proxying to: ${targetUrl.substring(0, 100)}`);
+  debug('PROXY', 'Proxying to upstream', { reqId, url: targetUrl?.substring(0, 100) });
 
   // Check if this URL should return a mock response (anti-bot endpoints)
   const mockResponse = getMockResponse(targetUrl);
   if (mockResponse) {
-    console.log(`[${reqId}] Returning mock response for anti-bot endpoint`);
+    debug('PROXY', 'Returning mock response for anti-bot endpoint', { reqId });
     res.status(mockResponse.status);
     res.type(mockResponse.contentType);
     return res.send(mockResponse.body);
   }
+// CodeRabbit test
 
-  // NOTE: token was created via the gateway's `/tokenize` flow which
+  // NOTE: token was created via the gateway's `/tokenize` flow whichh
   // already validated the target URL against the allowlist/DNS checks.
   // Re-validating here causes legitimate tokenized subresource requests
   // (assets on other hosts) to be blocked. Trust the token resolution
   // and skip a second validation step.
   
   // Determine if this is likely an HTML page request
+  // Use Sec-Fetch-Dest header (modern browsers) for accurate detection
   const acceptHeader = req.get('accept') || '';
+  const secFetchDest = req.get('sec-fetch-dest') || '';
+  const secFetchMode = req.get('sec-fetch-mode') || '';
+  
+  // Check if this is definitely NOT an HTML request based on Sec-Fetch-Dest
+  const isDefinitelyNotHtml = ['script', 'style', 'image', 'font', 'audio', 'video', 'worker', 'sharedworker'].includes(secFetchDest);
+  
+  // Check if URL has a known non-HTML extension
+  const hasNonHtmlExtension = targetUrl.match(/\.(js|mjs|css|json|png|jpg|jpeg|gif|svg|webp|woff|woff2|ttf|eot|otf|ico|mp4|webm|mp3|wav|pdf|xml|map|ts)(\?|$)/i);
+  
+  // Only use Playwright for actual HTML page navigations
   const isHtmlRequest = req.method === 'GET' && 
-    (acceptHeader.includes('text/html') || !acceptHeader || acceptHeader === '*/*') &&
-    !targetUrl.match(/\.(js|css|json|png|jpg|jpeg|gif|svg|woff|woff2|ttf|ico|mp4|webm|mp3|wav|pdf)(\?|$)/i);
+    !isDefinitelyNotHtml &&
+    !hasNonHtmlExtension &&
+    (acceptHeader.includes('text/html') || (secFetchDest === 'document') || (secFetchMode === 'navigate'));
+  
+  debug('PROXY', 'Request type analysis', {
+    reqId,
+    isHtmlRequest,
+    isDefinitelyNotHtml,
+    hasNonHtmlExtension: !!hasNonHtmlExtension,
+    secFetchDest,
+    secFetchMode,
+    willUsePlaywright: isHtmlRequest
+  });
   
   // Use Playwright for HTML page requests (for better JS compatibility)
   if (isHtmlRequest) {
@@ -894,22 +1049,25 @@ app.all('/go/:token', rateLimiter.middleware('proxy'), async (req, res) => {
       page.on('console', msg => {
         try {
           const text = msg.text();
-          console.log('[Playwright][console]', text);
+          debug('HTML', '[Playwright console]', { text: text?.substring(0, 200) });
         } catch (e) {}
       });
       page.on('pageerror', err => {
-        console.error('[Playwright][pageerror]', err && err.message ? err.message : err);
+        debugError('HTML', 'Playwright page error', err, { url: targetUrl?.substring(0, 100) });
         securityLogger.logWarning('Playwright pageerror', { url: targetUrl, error: err && err.message ? err.message : String(err) });
       });
       page.on('requestfailed', reqFail => {
         try {
           const failure = reqFail.failure();
-          console.warn('[Playwright][requestfailed]', reqFail.url(), failure && failure.errorText ? failure.errorText : failure);
+          debugWarn('HTML', 'Playwright request failed', { 
+            url: reqFail.url()?.substring(0, 100), 
+            error: failure?.errorText || String(failure)
+          });
           securityLogger.logWarning('Playwright requestfailed', { url: targetUrl, request: reqFail.url(), reason: failure && failure.errorText ? failure.errorText : String(failure) });
         } catch (e) {}
       });
       page.on('crash', () => {
-        console.error('[Playwright][crash] page crashed for', targetUrl);
+        debugError('HTML', 'Playwright page CRASHED', new Error('Page crash'), { url: targetUrl });
         securityLogger.logWarning('Playwright page crash', { url: targetUrl });
       });
 
@@ -936,6 +1094,7 @@ app.all('/go/:token', rateLimiter.middleware('proxy'), async (req, res) => {
         });
 
         if (!subValidation.valid) {
+          debug('HTML', 'Playwright sub-request BLOCKED', { url: requestUrl?.substring(0, 100), reason: subValidation.reason });
           return route.abort('blockedbyclient');
         }
         
@@ -943,17 +1102,23 @@ app.all('/go/:token', rateLimiter.middleware('proxy'), async (req, res) => {
         return route.continue();
       });
       
+      debug('HTML', 'Navigating with Playwright', { reqId, url: targetUrl?.substring(0, 100) });
+      
       // Navigate to the page
       const response = await page.goto(targetUrl, {
         waitUntil: 'domcontentloaded',
         timeout: 20000
       });
       
+      debug('HTML', 'Page loaded, waiting for JS execution', { reqId, status: response?.status() });
+      
       // Wait a bit for JS to execute
       await page.waitForTimeout(1500);
       
       // Get the rendered HTML
       const html = await page.content();
+      
+      debug('HTML', 'Got rendered HTML', { reqId, htmlLength: html?.length });
       
       // Return page to pool
       await page.close();
@@ -977,11 +1142,13 @@ app.all('/go/:token', rateLimiter.middleware('proxy'), async (req, res) => {
         pageToken: token
       });
       
+      debug('HTML', 'HTML rewritten, sending response', { reqId, originalLength: html?.length, rewrittenLength: rewrittenHtml?.length });
+      
       res.set('Content-Type', 'text/html; charset=utf-8');
       return res.send(rewrittenHtml);
       
     } catch (e) {
-      console.error('Playwright proxy error:', e.message);
+      debugError('HTML', 'Playwright proxy error - falling back to fetch', e, { reqId, url: targetUrl?.substring(0, 100) });
       // Fall through to fetch-based proxy
     }
   }
@@ -989,16 +1156,31 @@ app.all('/go/:token', rateLimiter.middleware('proxy'), async (req, res) => {
   // Use fetch for non-HTML or if Playwright fails
   // Helper to attempt HTTP fallback for SSL errors
   async function fetchWithHttpFallback(url, options) {
+    debug('FETCH', 'Starting fetch', { url: url?.substring(0, 150), method: options?.method || 'GET' });
     try {
-      return await fetch(url, options);
+      const response = await fetch(url, options);
+      debug('FETCH', 'Fetch successful', { 
+        url: url?.substring(0, 100), 
+        status: response.status, 
+        contentType: response.headers.get('content-type')?.substring(0, 50)
+      });
+      return response;
     } catch (e) {
+      debugError('FETCH', 'Fetch failed', e, { url: url?.substring(0, 100) });
       // If HTTPS fails with SSL error, try HTTP fallback
       if (url.startsWith('https://') && 
           (e.message.includes('SSL') || e.message.includes('EPROTO') || 
            e.message.includes('certificate') || e.message.includes('TLS'))) {
-        console.log('[Gateway] HTTPS failed, trying HTTP fallback for:', url);
+        debug('FETCH', 'Attempting HTTP fallback for SSL error', { url: url?.substring(0, 100) });
         const httpUrl = url.replace(/^https:/, 'http:');
-        return await fetch(httpUrl, { ...options, agent: httpAgent });
+        try {
+          const response = await fetch(httpUrl, { ...options, agent: httpAgent });
+          debug('FETCH', 'HTTP fallback successful', { url: httpUrl?.substring(0, 100), status: response.status });
+          return response;
+        } catch (e2) {
+          debugError('FETCH', 'HTTP fallback also failed', e2, { url: httpUrl?.substring(0, 100) });
+          throw e2;
+        }
       }
       throw e;
     }
@@ -1135,6 +1317,39 @@ app.all('/go/:token', rateLimiter.middleware('proxy'), async (req, res) => {
       if (contentType) {
         res.set('Content-Type', contentType);
       }
+      
+      // Special handling for video/audio streaming with Range support
+      const isMedia = contentType.includes('video') || contentType.includes('audio') || 
+                      targetUrl.match(/\.(mp4|webm|m4v|mov|mp3|m4a|aac|ogg|wav|m3u8|ts)(\?|$)/i);
+      
+      if (isMedia) {
+        // Forward Content-Range, Accept-Ranges, Content-Length for seeking
+        const contentRange = upstreamResponse.headers.get('content-range');
+        const acceptRanges = upstreamResponse.headers.get('accept-ranges');
+        const contentLength = upstreamResponse.headers.get('content-length');
+        
+        if (contentRange) res.set('Content-Range', contentRange);
+        if (acceptRanges) res.set('Accept-Ranges', acceptRanges);
+        if (contentLength) res.set('Content-Length', contentLength);
+        
+        debug('STREAM', 'Streaming media content', {
+          reqId,
+          url: targetUrl?.substring(0, 80),
+          contentType,
+          contentLength: contentLength || 'unknown',
+          contentRange: contentRange || 'none',
+          acceptRanges: acceptRanges || 'none',
+          status: upstreamResponse.status
+        });
+        
+        // Stream directly without caching (videos are too large)
+        upstreamResponse.body.pipe(res);
+        upstreamResponse.body.on('error', (err) => {
+          debugError('STREAM', 'Media stream error', err, { url: targetUrl?.substring(0, 80) });
+        });
+        return;
+      }
+      
       // For cacheable static assets, buffer and cache
       if (isCacheable && req.method === 'GET') {
         const chunks = [];
@@ -1142,11 +1357,13 @@ app.all('/go/:token', rateLimiter.middleware('proxy'), async (req, res) => {
         upstreamResponse.body.on('end', () => {
           const body = Buffer.concat(chunks);
           if (body.length < 5 * 1024 * 1024) { // Only cache < 5MB
+            debug('CACHE', 'Caching response', { cacheKey, size: body.length });
             setCachedResponse(cacheKey, body, contentType);
           }
           res.send(body);
         });
         upstreamResponse.body.on('error', (err) => {
+          debugError('PROXY', 'Upstream body stream error', err, { url: targetUrl?.substring(0, 100) });
           if (!res.headersSent) res.status(502).send('Upstream error');
         });
       } else {
@@ -1155,7 +1372,14 @@ app.all('/go/:token', rateLimiter.middleware('proxy'), async (req, res) => {
     }
     
   } catch (e) {
-    console.error('Proxy error:', e.message);
+    debugError('PROXY', 'PROXY REQUEST FAILED', e, { 
+      reqId,
+      url: targetUrl?.substring(0, 100),
+      method: req.method,
+      errorCode: e.code,
+      errorType: e.type,
+      hint: 'Check if the upstream server is reachable and responding'
+    });
     securityLogger.logWarning('Proxy request failed', { url: targetUrl, error: e.message });
     if (!res.headersSent) {
       // Return appropriate error based on expected content type
@@ -1167,7 +1391,12 @@ app.all('/go/:token', rateLimiter.middleware('proxy'), async (req, res) => {
       } else if (acceptHeader.includes('css') || targetUrl.endsWith('.css')) {
         res.status(502).type('text/css').send(`/* Gateway Error: ${e.message} */`);
       } else {
-        res.status(502).json({ error: 'Upstream request failed' });
+        res.status(502).json({ 
+          error: 'Upstream request failed',
+          details: e.message,
+          code: e.code,
+          url: targetUrl?.substring(0, 100)
+        });
       }
     }
   }
@@ -1632,8 +1861,41 @@ app.all('*', async (req, res) => {
   }
   
   // For non-root paths that look like navigation (HTML accept header),
-  // return a simple error page instead of the frontend to prevent loops
+  // try to resolve against the Referer's original URL and redirect to tokenized version
   if (isNavigation) {
+    try {
+      const referer = req.get('referer') || '';
+      const m = referer.match(/\/go\/([A-Za-z0-9_-]+)/);
+      if (m) {
+        const refToken = m[1];
+        const resolution = tokenStore.resolveToken(refToken, null);
+        if (resolution.valid) {
+          // Resolve the relative path against the original page URL
+          const upstreamUrl = resolveUrl(req.originalUrl || req.path, resolution.url);
+          console.log(`[Catch-all] Resolving navigation: ${req.path} -> ${upstreamUrl}`);
+          
+          const validation = validateUrl(upstreamUrl, {
+            allowedOrigin: config.allowedOrigin,
+            additionalOrigins: config.additionalOrigins,
+            allowAnyOrigin: config.allowAny
+          });
+          
+          if (validation.valid) {
+            // Create a token for the resolved URL and redirect
+            try {
+              const { token: newToken } = tokenStore.createToken(upstreamUrl, resolution.sessionId || 'anonymous');
+              console.log(`[Catch-all] Redirecting to tokenized: /go/${newToken}`);
+              return res.redirect(302, `/go/${newToken}`);
+            } catch (e) {
+              console.warn('[Catch-all] Token creation failed:', e.message);
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('[Catch-all] Navigation resolution failed:', e.message);
+    }
+    
     return res.status(404).type('text/html').send(`
       <!DOCTYPE html>
       <html>
@@ -1656,10 +1918,27 @@ app.all('*', async (req, res) => {
 // ============================================================================
 
 app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
+  debugError('ERROR', 'UNHANDLED EXPRESS ERROR', err, {
+    path: req.path,
+    method: req.method,
+    query: req.query,
+    ip: req.ip,
+    headers: {
+      accept: req.get('accept')?.substring(0, 50),
+      referer: req.get('referer')?.substring(0, 80),
+      'content-type': req.get('content-type')
+    }
+  });
   securityLogger.logWarning('Unhandled error', { error: err.message });
   
-  res.status(500).json({ error: 'Internal server error' });
+  if (!res.headersSent) {
+    res.status(500).json({ 
+      error: 'Internal server error',
+      details: err.message,
+      path: req.path,
+      hint: 'Check server logs for full stack trace'
+    });
+  }
 });
 
 // ============================================================================

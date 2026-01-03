@@ -6,8 +6,25 @@
 
 const crypto = require('crypto');
 
+// Debug helper
+function debug(category, message, data = {}) {
+  const timestamp = new Date().toISOString();
+  console.log(`[DEBUG][${timestamp}][TokenStore][${category}]`, message, JSON.stringify(data, null, 2));
+}
+
+function debugError(category, message, error, data = {}) {
+  const timestamp = new Date().toISOString();
+  console.error(`[ERROR][${timestamp}][TokenStore][${category}]`, message, {
+    error: error?.message || error,
+    stack: error?.stack?.substring(0, 500),
+    ...data
+  });
+}
+
 class TokenStore {
   constructor(options = {}) {
+    debug('INIT', 'Creating TokenStore', { ttl: options.ttl, maxTokensPerSession: options.maxTokensPerSession });
+    
     // Token expiration time in milliseconds (default: 1 hour)
     this.defaultTTL = options.ttl || 60 * 60 * 1000;
     
@@ -21,85 +38,130 @@ class TokenStore {
     
     // Cleanup interval (run every 5 minutes)
     this.cleanupInterval = setInterval(() => this.cleanup(), 5 * 60 * 1000);
+    
+    debug('INIT', 'TokenStore initialized', { defaultTTL: this.defaultTTL, maxTokensPerSession: this.maxTokensPerSession });
   }
   
   /**
    * Generate a secure random token
    */
   generateToken() {
-    return crypto.randomBytes(32).toString('base64url');
+    const token = crypto.randomBytes(32).toString('base64url');
+    debug('GENERATE', 'Generated new token', { tokenPreview: token.substring(0, 12) + '...' });
+    return token;
   }
   
   /**
    * Create a token for a URL
-   * @param {string} url - The target URL
-   * @param {string} sessionId - Session identifier
-   * @param {Object} options - Additional options
-   * @param {number} [options.ttl] - Custom TTL for this token
-   * @returns {{ token: string, cached: boolean }}
    */
   createToken(url, sessionId, options = {}) {
-    const ttl = options.ttl || this.defaultTTL;
-    const cacheKey = `${url}:${sessionId}`;
+    debug('CREATE', 'createToken called', { 
+      url: url?.substring(0, 100), 
+      sessionId: sessionId?.substring(0, 12) + '...',
+      options 
+    });
     
-    // Check if we already have a valid token for this URL + session
-    const existingToken = this.urlToToken.get(cacheKey);
-    if (existingToken) {
-      const data = this.tokens.get(existingToken);
-      if (data && data.exp > Date.now()) {
-        return { token: existingToken, cached: true };
+    try {
+      const ttl = options.ttl || this.defaultTTL;
+      const cacheKey = `${url}:${sessionId}`;
+      
+      // Check if we already have a valid token for this URL + session
+      const existingToken = this.urlToToken.get(cacheKey);
+      if (existingToken) {
+        const data = this.tokens.get(existingToken);
+        if (data && data.exp > Date.now()) {
+          debug('CREATE', 'Returning cached token', { 
+            tokenPreview: existingToken.substring(0, 12) + '...',
+            expiresIn: data.exp - Date.now()
+          });
+          return { token: existingToken, cached: true };
+        }
+        // Token expired, clean it up
+        debug('CREATE', 'Cached token expired, cleaning up', { tokenPreview: existingToken.substring(0, 12) + '...' });
+        this.tokens.delete(existingToken);
+        this.urlToToken.delete(cacheKey);
       }
-      // Token expired, clean it up
-      this.tokens.delete(existingToken);
-      this.urlToToken.delete(cacheKey);
+      
+      // Check session token limit
+      const currentCount = this.sessionTokenCount.get(sessionId) || 0;
+      if (currentCount >= this.maxTokensPerSession) {
+        debugError('CREATE', 'Token limit exceeded', null, { 
+          sessionId: sessionId?.substring(0, 12) + '...',
+          currentCount,
+          maxTokensPerSession: this.maxTokensPerSession
+        });
+        throw new Error(`Token limit exceeded for session (${currentCount}/${this.maxTokensPerSession})`);
+      }
+      
+      // Generate new token
+      const token = this.generateToken();
+      const exp = Date.now() + ttl;
+      
+      // Store mappings
+      this.tokens.set(token, { url, exp, sessionId });
+      this.urlToToken.set(cacheKey, token);
+      this.sessionTokenCount.set(sessionId, currentCount + 1);
+      
+      debug('CREATE', 'Token created successfully', { 
+        tokenPreview: token.substring(0, 12) + '...',
+        url: url.substring(0, 80),
+        expiresIn: ttl,
+        sessionTokenCount: currentCount + 1
+      });
+      
+      return { token, cached: false };
+    } catch (e) {
+      debugError('CREATE', 'Failed to create token', e, { url: url?.substring(0, 100), sessionId: sessionId?.substring(0, 12) + '...' });
+      throw e;
     }
-    
-    // Check session token limit
-    const currentCount = this.sessionTokenCount.get(sessionId) || 0;
-    if (currentCount >= this.maxTokensPerSession) {
-      throw new Error('Token limit exceeded for session');
-    }
-    
-    // Generate new token
-    const token = this.generateToken();
-    const exp = Date.now() + ttl;
-    
-    // Store mappings
-    this.tokens.set(token, { url, exp, sessionId });
-    this.urlToToken.set(cacheKey, token);
-    this.sessionTokenCount.set(sessionId, currentCount + 1);
-    
-    return { token, cached: false };
   }
   
   /**
    * Resolve a token to its URL
-   * @param {string} token - The token to resolve
-   * @param {string} sessionId - Session identifier (for validation)
-   * @returns {{ valid: boolean, url?: string, reason?: string }}
    */
   resolveToken(token, sessionId) {
-    const data = this.tokens.get(token);
+    debug('RESOLVE', 'resolveToken called', { 
+      tokenPreview: token?.substring(0, 12) + '...',
+      sessionId: sessionId ? sessionId.substring(0, 12) + '...' : 'null'
+    });
     
-    if (!data) {
-      return { valid: false, reason: 'Token not found' };
+    try {
+      const data = this.tokens.get(token);
+      
+      if (!data) {
+        debug('RESOLVE', 'Token NOT FOUND in store', { 
+          tokenPreview: token?.substring(0, 12) + '...',
+          totalTokensInStore: this.tokens.size
+        });
+        return { valid: false, reason: 'Token not found' };
+      }
+      
+      const now = Date.now();
+      if (data.exp < now) {
+        debug('RESOLVE', 'Token EXPIRED', { 
+          tokenPreview: token?.substring(0, 12) + '...',
+          expiredAt: new Date(data.exp).toISOString(),
+          expiredAgo: now - data.exp
+        });
+        // Clean up expired token
+        this.tokens.delete(token);
+        const cacheKey = `${data.url}:${data.sessionId}`;
+        this.urlToToken.delete(cacheKey);
+        return { valid: false, reason: `Token expired ${Math.round((now - data.exp) / 1000)}s ago` };
+      }
+      
+      debug('RESOLVE', 'Token VALID', { 
+        tokenPreview: token?.substring(0, 12) + '...',
+        url: data.url?.substring(0, 80),
+        expiresIn: data.exp - now,
+        sessionId: data.sessionId?.substring(0, 12) + '...'
+      });
+      
+      return { valid: true, url: data.url, sessionId: data.sessionId };
+    } catch (e) {
+      debugError('RESOLVE', 'Failed to resolve token', e, { tokenPreview: token?.substring(0, 12) + '...' });
+      return { valid: false, reason: `Resolution error: ${e.message}` };
     }
-    
-    if (data.exp < Date.now()) {
-      // Clean up expired token
-      this.tokens.delete(token);
-      const cacheKey = `${data.url}:${data.sessionId}`;
-      this.urlToToken.delete(cacheKey);
-      return { valid: false, reason: 'Token expired' };
-    }
-    
-    // Optionally validate session matches (can be disabled for shared resources)
-    // if (data.sessionId !== sessionId) {
-    //   return { valid: false, reason: 'Session mismatch' };
-    // }
-    
-    // Return sessionId so callers can use it for creating sub-tokens
-    return { valid: true, url: data.url, sessionId: data.sessionId };
   }
   
   /**
@@ -186,6 +248,8 @@ class TokenStore {
  */
 class SessionStore {
   constructor(options = {}) {
+    debug('SESSION_INIT', 'Creating SessionStore', { ttl: options.ttl });
+    
     // Session expiration time (default: 24 hours)
     this.defaultTTL = options.ttl || 24 * 60 * 60 * 1000;
     
@@ -194,46 +258,83 @@ class SessionStore {
     
     // Cleanup interval
     this.cleanupInterval = setInterval(() => this.cleanup(), 10 * 60 * 1000);
+    
+    debug('SESSION_INIT', 'SessionStore initialized', { defaultTTL: this.defaultTTL });
   }
   
   /**
    * Create a new session
    */
   createSession(ip, userAgent = '') {
-    const sessionToken = crypto.randomBytes(32).toString('base64url');
-    const now = Date.now();
+    debug('SESSION_CREATE', 'Creating new session', { ip, userAgent: userAgent?.substring(0, 50) });
     
-    this.sessions.set(sessionToken, {
-      exp: now + this.defaultTTL,
-      ip,
-      userAgent,
-      createdAt: now
-    });
-    
-    return { sessionToken, expiresIn: this.defaultTTL };
+    try {
+      const sessionToken = crypto.randomBytes(32).toString('base64url');
+      const now = Date.now();
+      
+      this.sessions.set(sessionToken, {
+        exp: now + this.defaultTTL,
+        ip,
+        userAgent,
+        createdAt: now
+      });
+      
+      debug('SESSION_CREATE', 'Session created successfully', { 
+        tokenPreview: sessionToken.substring(0, 12) + '...',
+        expiresIn: this.defaultTTL,
+        totalSessions: this.sessions.size
+      });
+      
+      return { sessionToken, expiresIn: this.defaultTTL };
+    } catch (e) {
+      debugError('SESSION_CREATE', 'Failed to create session', e, { ip, userAgent: userAgent?.substring(0, 50) });
+      throw e;
+    }
   }
   
   /**
    * Validate a session token
    */
   validateSession(sessionToken, ip) {
-    const data = this.sessions.get(sessionToken);
+    debug('SESSION_VALIDATE', 'Validating session', { 
+      tokenPreview: sessionToken?.substring(0, 12) + '...',
+      ip
+    });
     
-    if (!data) {
-      return { valid: false, reason: 'Session not found' };
+    try {
+      const data = this.sessions.get(sessionToken);
+      
+      if (!data) {
+        debug('SESSION_VALIDATE', 'Session NOT FOUND', { 
+          tokenPreview: sessionToken?.substring(0, 12) + '...',
+          totalSessions: this.sessions.size
+        });
+        return { valid: false, reason: 'Session not found' };
+      }
+      
+      const now = Date.now();
+      if (data.exp < now) {
+        debug('SESSION_VALIDATE', 'Session EXPIRED', { 
+          tokenPreview: sessionToken?.substring(0, 12) + '...',
+          expiredAt: new Date(data.exp).toISOString(),
+          expiredAgo: now - data.exp
+        });
+        this.sessions.delete(sessionToken);
+        return { valid: false, reason: `Session expired ${Math.round((now - data.exp) / 1000)}s ago` };
+      }
+      
+      debug('SESSION_VALIDATE', 'Session VALID', { 
+        tokenPreview: sessionToken?.substring(0, 12) + '...',
+        expiresIn: data.exp - now,
+        originalIp: data.ip,
+        requestIp: ip
+      });
+      
+      return { valid: true, session: data };
+    } catch (e) {
+      debugError('SESSION_VALIDATE', 'Failed to validate session', e, { tokenPreview: sessionToken?.substring(0, 12) + '...' });
+      return { valid: false, reason: `Validation error: ${e.message}` };
     }
-    
-    if (data.exp < Date.now()) {
-      this.sessions.delete(sessionToken);
-      return { valid: false, reason: 'Session expired' };
-    }
-    
-    // Optional: Validate IP hasn't changed (can be strict or relaxed)
-    // if (data.ip !== ip) {
-    //   return { valid: false, reason: 'IP mismatch' };
-    // }
-    
-    return { valid: true, session: data };
   }
   
   /**
@@ -243,8 +344,10 @@ class SessionStore {
     const data = this.sessions.get(sessionToken);
     if (data) {
       data.exp = Date.now() + this.defaultTTL;
+      debug('SESSION_REFRESH', 'Session refreshed', { tokenPreview: sessionToken.substring(0, 12) + '...' });
       return true;
     }
+    debug('SESSION_REFRESH', 'Session not found for refresh', { tokenPreview: sessionToken?.substring(0, 12) + '...' });
     return false;
   }
   
@@ -252,7 +355,9 @@ class SessionStore {
    * Revoke a session
    */
   revokeSession(sessionToken) {
-    return this.sessions.delete(sessionToken);
+    const deleted = this.sessions.delete(sessionToken);
+    debug('SESSION_REVOKE', deleted ? 'Session revoked' : 'Session not found', { tokenPreview: sessionToken?.substring(0, 12) + '...' });
+    return deleted;
   }
   
   /**
@@ -260,17 +365,30 @@ class SessionStore {
    */
   cleanup() {
     const now = Date.now();
+    let cleaned = 0;
     for (const [token, data] of this.sessions.entries()) {
       if (data.exp < now) {
         this.sessions.delete(token);
+        cleaned++;
       }
     }
+    if (cleaned > 0) {
+      debug('SESSION_CLEANUP', 'Cleaned expired sessions', { cleaned, remaining: this.sessions.size });
+    }
+  }
+  
+  /**
+   * Get count of active sessions
+   */
+  getActiveSessions() {
+    return this.sessions.size;
   }
   
   /**
    * Shutdown
    */
   shutdown() {
+    debug('SESSION_SHUTDOWN', 'Shutting down SessionStore', { sessions: this.sessions.size });
     clearInterval(this.cleanupInterval);
     this.sessions.clear();
   }

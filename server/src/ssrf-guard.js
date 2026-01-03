@@ -9,6 +9,19 @@ const { promisify } = require('util');
 
 const dnsLookup = promisify(dns.lookup);
 
+// Debug logging
+function debug(category, message, data = {}) {
+  console.log(`[SSRF-GUARD:${category}] ${message}`, JSON.stringify(data, null, 2));
+}
+
+function debugError(category, message, error, data = {}) {
+  console.error(`[SSRF-GUARD:${category}] ❌ ${message}`, {
+    error: error?.message || error,
+    stack: error?.stack?.split('\n').slice(0, 3).join('\n'),
+    ...data
+  });
+}
+
 // Forbidden URL schemes
 const FORBIDDEN_SCHEMES = new Set([
   'file:',
@@ -104,9 +117,16 @@ function looksLikeIP(hostname) {
 function validateUrl(targetUrl, config) {
   const { allowedOrigin, additionalOrigins = [], allowWebSocket = false, allowedWsOrigin, allowAnyOrigin = false } = config;
   
+  debug('VALIDATE', 'Validating URL', { 
+    url: targetUrl?.substring(0, 100),
+    allowAnyOrigin,
+    allowWebSocket 
+  });
+  
   // Check for passthrough schemes (mailto:, tel:, etc.)
   for (const scheme of PASSTHROUGH_SCHEMES) {
     if (targetUrl.toLowerCase().startsWith(scheme)) {
+      debug('VALIDATE', 'Passthrough scheme detected', { scheme, url: targetUrl });
       return { valid: true, passthrough: true, url: null };
     }
   }
@@ -115,7 +135,8 @@ function validateUrl(targetUrl, config) {
   try {
     url = new URL(targetUrl);
   } catch (e) {
-    return { valid: false, reason: 'Invalid URL format' };
+    debug('VALIDATE', 'URL REJECTED - Invalid format', { url: targetUrl, error: e.message });
+    return { valid: false, reason: `Invalid URL format: ${e.message}` };
   }
   
   // Check for forbidden schemes
@@ -123,34 +144,46 @@ function validateUrl(targetUrl, config) {
     // Special handling for WebSocket if enabled
     if ((url.protocol === 'ws:' || url.protocol === 'wss:') && allowWebSocket) {
       if (allowedWsOrigin && url.origin === new URL(allowedWsOrigin).origin) {
+        debug('VALIDATE', 'WebSocket URL allowed', { url: targetUrl });
         return { valid: true, url };
       }
-      return { valid: false, reason: 'WebSocket origin not allowed' };
+      debug('VALIDATE', 'URL REJECTED - WebSocket origin not allowed', { 
+        url: targetUrl, 
+        origin: url.origin, 
+        allowedWsOrigin 
+      });
+      return { valid: false, reason: `WebSocket origin not allowed: ${url.origin}` };
     }
+    debug('VALIDATE', 'URL REJECTED - Forbidden scheme', { url: targetUrl, scheme: url.protocol });
     return { valid: false, reason: `Forbidden scheme: ${url.protocol}` };
   }
   
   // Only allow http and https
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    debug('VALIDATE', 'URL REJECTED - Unsupported scheme', { url: targetUrl, scheme: url.protocol });
     return { valid: false, reason: `Unsupported scheme: ${url.protocol}` };
   }
   
   // Check blocked hostnames
   const hostname = url.hostname.toLowerCase();
   if (BLOCKED_HOSTNAMES.has(hostname)) {
+    debug('VALIDATE', 'URL REJECTED - Blocked hostname', { url: targetUrl, hostname });
     return { valid: false, reason: `Blocked hostname: ${hostname}` };
   }
   
   // Check if hostname is an IP address in private range
   if (looksLikeIP(hostname) && isPrivateIP(hostname)) {
+    debug('VALIDATE', 'URL REJECTED - Private IP', { url: targetUrl, hostname });
     return { valid: false, reason: `Private IP address blocked: ${hostname}` };
   }
   
   // If configured, allow any http(s) origin (DANGEROUS: opt-in only)
   if (allowAnyOrigin) {
     if (url.protocol === 'http:' || url.protocol === 'https:') {
+      debug('VALIDATE', 'URL ALLOWED (allowAnyOrigin=true)', { url: targetUrl });
       return { valid: true, url };
     }
+    debug('VALIDATE', 'URL REJECTED - Unsupported scheme with allowAnyOrigin', { url: targetUrl, scheme: url.protocol });
     return { valid: false, reason: `Unsupported scheme: ${url.protocol}` };
   }
 
@@ -168,9 +201,15 @@ function validateUrl(targetUrl, config) {
 
   // Check against allowlist
   if (!allAllowedOrigins.includes(url.origin)) {
-    return { valid: false, reason: `Origin not in allowlist: ${url.origin}` };
+    debug('VALIDATE', 'URL REJECTED - Origin not in allowlist', { 
+      url: targetUrl, 
+      urlOrigin: url.origin,
+      allowedOrigins: allAllowedOrigins 
+    });
+    return { valid: false, reason: `Origin not in allowlist: ${url.origin}. Allowed: ${allAllowedOrigins.join(', ')}` };
   }
   
+  debug('VALIDATE', 'URL ALLOWED', { url: targetUrl });
   return { valid: true, url };
 }
 
@@ -179,8 +218,13 @@ function validateUrl(targetUrl, config) {
  * Ensures hostname doesn't resolve to a private IP
  */
 async function validateUrlWithDNS(targetUrl, config) {
+  debug('VALIDATE_DNS', 'Starting DNS validation', { url: targetUrl?.substring(0, 100) });
+  
   const result = validateUrl(targetUrl, config);
-  if (!result.valid || result.passthrough) return result;
+  if (!result.valid || result.passthrough) {
+    debug('VALIDATE_DNS', 'Skipping DNS check - basic validation result', { valid: result.valid, passthrough: result.passthrough });
+    return result;
+  }
   
   const { url } = result;
   const hostname = url.hostname;
@@ -188,25 +232,32 @@ async function validateUrlWithDNS(targetUrl, config) {
   // If operator explicitly enabled allowAnyOrigin, skip DNS resolution
   // to avoid blocking valid public hosts due to transient DNS failures.
   if (config && config.allowAnyOrigin) {
+    debug('VALIDATE_DNS', 'Skipping DNS check - allowAnyOrigin enabled', { hostname });
     return result;
   }
   
   // Skip DNS check for allowed IP addresses
   if (looksLikeIP(hostname)) {
+    debug('VALIDATE_DNS', 'Skipping DNS check - already an IP', { hostname });
     return result;
   }
   
   try {
     // Resolve hostname to check for DNS rebinding attacks
     const { address } = await dnsLookup(hostname);
+    debug('VALIDATE_DNS', 'DNS resolved', { hostname, resolvedIP: address });
+    
     if (isPrivateIP(address)) {
+      debug('VALIDATE_DNS', 'URL REJECTED - Resolves to private IP', { hostname, address });
       return { valid: false, reason: `Hostname resolves to private IP: ${address}` };
     }
   } catch (e) {
     // DNS resolution failed - could be intentional for internal hosts
-    return { valid: false, reason: `DNS resolution failed for: ${hostname}` };
+    debugError('VALIDATE_DNS', 'DNS resolution failed', e, { hostname });
+    return { valid: false, reason: `DNS resolution failed for: ${hostname} (${e.message})` };
   }
   
+  debug('VALIDATE_DNS', 'URL passed DNS validation', { hostname });
   return result;
 }
 
@@ -239,11 +290,17 @@ const DANGEROUS_HEADERS = new Set([
  */
 function filterRequestHeaders(headers) {
   const filtered = {};
+  const removed = [];
   for (const [key, value] of Object.entries(headers)) {
     const lowerKey = key.toLowerCase();
     if (!DANGEROUS_HEADERS.has(lowerKey) && !lowerKey.startsWith('proxy-')) {
       filtered[key] = value;
+    } else {
+      removed.push(key);
     }
+  }
+  if (removed.length > 0) {
+    debug('FILTER_REQ', 'Removed dangerous headers', { removed });
   }
   return filtered;
 }
@@ -262,7 +319,8 @@ const PRESERVE_RESPONSE_HEADERS = [
   'etag',
   'last-modified',
   'vary',
-  'accept-ranges'
+  'accept-ranges',
+  'content-range'  // For video/audio seeking support
 ];
 
 /**
@@ -270,11 +328,14 @@ const PRESERVE_RESPONSE_HEADERS = [
  */
 function filterResponseHeaders(headers) {
   const filtered = {};
+  const preserved = [];
   for (const key of PRESERVE_RESPONSE_HEADERS) {
     if (headers[key] || headers[key.toLowerCase()]) {
       filtered[key] = headers[key] || headers[key.toLowerCase()];
+      preserved.push(key);
     }
   }
+  debug('FILTER_RES', 'Preserved response headers', { preserved, total: Object.keys(headers).length });
   return filtered;
 }
 

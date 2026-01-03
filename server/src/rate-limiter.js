@@ -3,8 +3,19 @@
  * Implements per-IP and per-session rate limiting
  */
 
+// Debug logging
+function debug(category, message, data = {}) {
+  console.log(`[RATE-LIMIT:${category}] ${message}`, JSON.stringify(data, null, 2));
+}
+
+function debugWarn(category, message, data = {}) {
+  console.warn(`[RATE-LIMIT:${category}] ⚠️ ${message}`, JSON.stringify(data, null, 2));
+}
+
 class RateLimiter {
   constructor(options = {}) {
+    debug('INIT', 'Creating RateLimiter', options);
+    
     // Default limits (set high to support modern JS-heavy sites)
     this.limits = {
       // Requests per window (per IP)
@@ -20,6 +31,8 @@ class RateLimiter {
       // Max concurrent requests per IP
       maxConcurrent: options.maxConcurrent || 50
     };
+    
+    debug('INIT', 'Rate limits configured', this.limits);
     
     // Whether to trust proxy headers for IP extraction
     this.trustProxy = options.trustProxy || false;
@@ -78,9 +91,14 @@ class RateLimiter {
     const concurrentEntry = this.concurrentRequests.get(ip);
     const concurrent = concurrentEntry ? concurrentEntry.count : 0;
     if (concurrent >= this.limits.maxConcurrent) {
+      debugWarn('LIMIT', 'BLOCKED - Too many concurrent requests', { 
+        ip, 
+        concurrent, 
+        max: this.limits.maxConcurrent 
+      });
       return {
         allowed: false,
-        reason: 'Too many concurrent requests',
+        reason: `Too many concurrent requests: ${concurrent}/${this.limits.maxConcurrent}`,
         retryAfter: 1
       };
     }
@@ -89,9 +107,15 @@ class RateLimiter {
     const ipBucket = this.getBucket(this.ipRequests, ip);
     if (ipBucket.count >= this.limits.requestsPerWindow) {
       const retryAfter = Math.ceil((ipBucket.windowStart + this.limits.windowMs - now) / 1000);
+      debugWarn('LIMIT', 'BLOCKED - IP rate limit exceeded', { 
+        ip, 
+        count: ipBucket.count, 
+        max: this.limits.requestsPerWindow,
+        retryAfter 
+      });
       return {
         allowed: false,
-        reason: 'IP rate limit exceeded',
+        reason: `IP rate limit exceeded: ${ipBucket.count}/${this.limits.requestsPerWindow} requests`,
         retryAfter: Math.max(retryAfter, 1)
       };
     }
@@ -101,9 +125,15 @@ class RateLimiter {
       const sessionBucket = this.getBucket(this.sessionRequests, sessionId);
       if (sessionBucket.count >= this.limits.sessionRequestsPerWindow) {
         const retryAfter = Math.ceil((sessionBucket.windowStart + this.limits.windowMs - now) / 1000);
+        debugWarn('LIMIT', 'BLOCKED - Session rate limit exceeded', { 
+          sessionId: sessionId.substring(0, 12) + '...', 
+          count: sessionBucket.count, 
+          max: this.limits.sessionRequestsPerWindow,
+          retryAfter 
+        });
         return {
           allowed: false,
-          reason: 'Session rate limit exceeded',
+          reason: `Session rate limit exceeded: ${sessionBucket.count}/${this.limits.sessionRequestsPerWindow} requests`,
           retryAfter: Math.max(retryAfter, 1)
         };
       }
@@ -115,9 +145,15 @@ class RateLimiter {
       const tokenBucket = this.getBucket(this.ipTokens, ip);
       if (tokenBucket.count >= this.limits.tokensPerWindow) {
         const retryAfter = Math.ceil((tokenBucket.windowStart + this.limits.windowMs - now) / 1000);
+        debugWarn('LIMIT', 'BLOCKED - IP token rate limit exceeded', { 
+          ip, 
+          count: tokenBucket.count, 
+          max: this.limits.tokensPerWindow,
+          retryAfter 
+        });
         return {
           allowed: false,
-          reason: 'IP token rate limit exceeded',
+          reason: `IP token rate limit exceeded: ${tokenBucket.count}/${this.limits.tokensPerWindow} tokens`,
           retryAfter: Math.max(retryAfter, 1)
         };
       }
@@ -127,9 +163,15 @@ class RateLimiter {
         const sessionTokenBucket = this.getBucket(this.sessionTokens, sessionId);
         if (sessionTokenBucket.count >= this.limits.sessionTokensPerWindow) {
           const retryAfter = Math.ceil((sessionTokenBucket.windowStart + this.limits.windowMs - now) / 1000);
+          debugWarn('LIMIT', 'BLOCKED - Session token rate limit exceeded', { 
+            sessionId: sessionId.substring(0, 12) + '...', 
+            count: sessionTokenBucket.count, 
+            max: this.limits.sessionTokensPerWindow,
+            retryAfter 
+          });
           return {
             allowed: false,
-            reason: 'Session token rate limit exceeded',
+            reason: `Session token rate limit exceeded: ${sessionTokenBucket.count}/${this.limits.sessionTokensPerWindow} tokens`,
             retryAfter: Math.max(retryAfter, 1)
           };
         }

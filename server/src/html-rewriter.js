@@ -28,41 +28,22 @@ const URL_ATTRIBUTES = {
 // CSS url() pattern
 const CSS_URL_PATTERN = /url\s*\(\s*['"]?([^'")\s]+)['"]?\s*\)/gi;
 
-// Video/media CDN domains that must bypass proxy (signed URLs check IP)
-// These CDN URLs should NOT be tokenized - they need direct access
+// Video/media CDN domains - NOW PROXIED for full encryption
+// Previously these were bypassed, but that exposed video traffic.
+// With server-side Playwright fetching pages, video URLs are signed for
+// the SERVER's IP, so proxying them through works and keeps all traffic encrypted.
 const VIDEO_CDN_BYPASS = [
-  'googlevideo.com',      // YouTube video CDN
-  'ytimg.com',            // YouTube images/thumbnails  
-  'ggpht.com',            // Google profile pics
-  'googleusercontent.com', // Google user content
-  'tiktokcdn.com',        // TikTok video CDN
-  'tiktokcdn-us.com',     // TikTok US CDN
-  'musical.ly',           // TikTok legacy CDN
-  'muscdn.com',           // TikTok music CDN
-  'ibytedtos.com',        // ByteDance CDN
-  'ibyteimg.com',         // ByteDance image CDN
-  'tiktokv.com',          // TikTok video hosting
-  'tiktokv.us',           // TikTok US video
-  'akamaized.net',        // Akamai CDN (used by many)
-  'cloudfront.net',       // AWS CloudFront  
-  'fastly.net',           // Fastly CDN
-  'cdn.jsdelivr.net',     // JSDelivr
-  'unpkg.com'             // UNPKG CDN
+  // DISABLED - We now proxy everything for full encryption
+  // Videos work because Playwright fetches pages and gets URLs signed for server IP
 ];
 
 /**
  * Check if URL is a video/media CDN that should bypass proxy
+ * NOTE: Now returns false for everything - we proxy ALL content for full encryption
  */
 function isVideoCdnUrl(url) {
-  try {
-    const u = new URL(url);
-    const hostname = u.hostname.toLowerCase();
-    for (const cdn of VIDEO_CDN_BYPASS) {
-      if (hostname === cdn || hostname.endsWith('.' + cdn)) {
-        return true;
-      }
-    }
-  } catch (e) {}
+  // DISABLED - All content now goes through proxy for full encryption
+  // The proxy server streams video content, keeping it hidden from network observers
   return false;
 }
 
@@ -386,10 +367,17 @@ function generateBootstrapScript(gatewayBase, sessionToken, pageToken, options =
   // ORIGINAL_BASE_URL already declared above for URL spoofing
   const TOKEN_CACHE = new Map();
   
-  // Debug logging helper
+  // Debug logging helper - COMPREHENSIVE MODE
   const DEBUG_BOOTSTRAP = true;
+  const DEBUG_VERBOSE = true; // Set to true for extra verbose logging
   function debugLog(...args) {
     if (DEBUG_BOOTSTRAP) console.log('[Gateway Bootstrap]', ...args);
+  }
+  function debugError(...args) {
+    console.error('[Gateway Bootstrap] ❌', ...args);
+  }
+  function debugWarn(...args) {
+    console.warn('[Gateway Bootstrap] ⚠️', ...args);
   }
   
   debugLog('Initializing with:', { 
@@ -541,50 +529,18 @@ function generateBootstrapScript(gatewayBase, sessionToken, pageToken, options =
     return GATEWAY_BASE + '/go/' + token;
   }
   
-  // Video/media CDN domains that must bypass proxy (signed URLs check IP)
+  // Video/media CDN domains - NOW PROXIED for full encryption
+  // Previously bypassed, but now we proxy everything so all traffic is encrypted
   const VIDEO_CDN_BYPASS = [
-    'googlevideo.com',      // YouTube video CDN
-    'ytimg.com',            // YouTube images/thumbnails  
-    'ggpht.com',            // Google profile pics
-    'googleusercontent.com', // Google user content
-    'tiktokcdn.com',        // TikTok video CDN
-    'tiktokcdn-us.com',     // TikTok US CDN
-    'musical.ly',           // TikTok legacy CDN
-    'muscdn.com',           // TikTok music CDN
-    'ibytedtos.com',        // ByteDance CDN
-    'ibyteimg.com',         // ByteDance image CDN
-    'tiktokv.com',          // TikTok video hosting
-    'tiktokv.us',           // TikTok US video
-    'akamaized.net',        // Akamai CDN (used by many)
-    'cloudfront.net',       // AWS CloudFront
-    'fastly.net',           // Fastly CDN
-    'cdn.jsdelivr.net',     // JSDelivr
-    'unpkg.com'             // UNPKG CDN
+    // DISABLED - All video/media now goes through proxy for full encryption
+    // Videos work because Playwright fetches pages server-side, getting URLs
+    // signed for the server's IP which can then fetch and stream the content
   ];
   
   // Check if URL is a video/media CDN that should bypass proxy
+  // NOTE: Now returns false - everything is proxied for encryption
   function isVideoCdnUrl(url) {
-    try {
-      const u = new URL(url, window.location.href);
-      const hostname = u.hostname.toLowerCase();
-      for (const cdn of VIDEO_CDN_BYPASS) {
-        if (hostname === cdn || hostname.endsWith('.' + cdn)) {
-          return true;
-        }
-      }
-      // Also check for video file extensions
-      const path = u.pathname.toLowerCase();
-      const videoExtensions = ['mp4', 'webm', 'm3u8', 'ts', 'm4s', 'mp3', 'aac', 'ogg', 'wav', 'flac'];
-      for (const ext of videoExtensions) {
-        if (path.endsWith('.' + ext) || path.includes('.' + ext + '?')) {
-          return true;
-        }
-      }
-      // Check for videoplayback in path (YouTube)
-      if (path.includes('videoplayback')) {
-        return true;
-      }
-    } catch (e) {}
+    // DISABLED - All content now proxied for full encryption
     return false;
   }
   
@@ -597,7 +553,8 @@ function generateBootstrapScript(gatewayBase, sessionToken, pageToken, options =
         lower.startsWith('mailto:') || lower.startsWith('tel:')) {
       return false;
     }
-    // Video CDN URLs must bypass proxy (signed URLs verify IP)
+    // Video/media CDNs are NOW tokenized and proxied for full encryption
+    // The isVideoCdnUrl function now returns false, so all videos go through proxy
     if (isVideoCdnUrl(url)) {
       console.log('[Gateway] Bypassing proxy for video CDN:', url.substring(0, 80));
       return false;
@@ -656,8 +613,17 @@ function generateBootstrapScript(gatewayBase, sessionToken, pageToken, options =
       } else {
         // Tokenization failed - return a fake failed response instead of trying original URL
         // (original URL would fail due to CORS anyway)
-        console.error('[Gateway FETCH] [#' + fetchId + '] Tokenization FAILED, returning error response');
-        return new Response(JSON.stringify({ error: 'Gateway: tokenization failed', status_code: -1 }), {
+        debugError('[#' + fetchId + '] Tokenization FAILED for URL:', url.substring(0, 100));
+        debugError('[#' + fetchId + '] Possible causes: Server not reachable, invalid URL, rate limiting');
+        debugError('[#' + fetchId + '] Gateway base:', GATEWAY_BASE);
+        debugError('[#' + fetchId + '] Session token present:', !!SESSION_TOKEN);
+        debugError('[#' + fetchId + '] Page token present:', !!PAGE_TOKEN);
+        return new Response(JSON.stringify({ 
+          error: 'Gateway: tokenization failed', 
+          status_code: -1,
+          details: 'Could not obtain token for URL: ' + url.substring(0, 100),
+          hint: 'Check browser console and server logs for more details'
+        }), {
           status: 503,
           statusText: 'Gateway Unavailable',
           headers: { 'Content-Type': 'application/json' }
