@@ -143,10 +143,8 @@ class TokenStore {
           expiredAt: new Date(data.exp).toISOString(),
           expiredAgo: now - data.exp
         });
-        // Clean up expired token
-        this.tokens.delete(token);
-        const cacheKey = `${data.url}:${data.sessionId}`;
-        this.urlToToken.delete(cacheKey);
+        // Clean up expired token using revokeToken for proper bookkeeping (including sessionTokenCount)
+        this.revokeToken(token);
         return { valid: false, reason: `Token expired ${Math.round((now - data.exp) / 1000)}s ago` };
       }
       

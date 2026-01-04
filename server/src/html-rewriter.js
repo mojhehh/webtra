@@ -226,9 +226,18 @@ function generateBootstrapScript(gatewayBase, sessionToken, pageToken, options =
             configurable: true
           });
         });
-        // Copy methods
-        locationProxy.assign = _originalLocation.assign.bind(_originalLocation);
-        locationProxy.replace = _originalLocation.replace.bind(_originalLocation);
+        // Copy methods - but INTERCEPT assign and replace to tokenize URLs!
+        var _origAssign = _originalLocation.assign.bind(_originalLocation);
+        var _origReplace = _originalLocation.replace.bind(_originalLocation);
+        
+        locationProxy.assign = function(url) {
+          console.log('[Gateway Bootstrap] location.assign intercepted:', url);
+          handleLocationNavigation(url, _origAssign);
+        };
+        locationProxy.replace = function(url) {
+          console.log('[Gateway Bootstrap] location.replace intercepted:', url);
+          handleLocationNavigation(url, _origReplace);
+        };
         locationProxy.reload = _originalLocation.reload.bind(_originalLocation);
         locationProxy.toString = function() { return originalUrl.href; };
         
@@ -244,6 +253,123 @@ function generateBootstrapScript(gatewayBase, sessionToken, pageToken, options =
       console.warn('[Gateway Bootstrap] URL parsing failed:', e.message);
     }
   }
+  
+  // Helper function to handle location navigations (assign, replace, href setter)
+  // This MUST be defined early but uses tokenizeUrl which is defined later
+  // So we set up a deferred handler
+  var _pendingLocationNavs = [];
+  var _locationNavReady = false;
+  
+  function handleLocationNavigation(url, originalMethod) {
+    console.log('[Gateway Bootstrap] handleLocationNavigation called:', url?.substring?.(0, 100) || url);
+    
+    // If url is empty/null, just navigate
+    if (!url) {
+      originalMethod(url);
+      return;
+    }
+    
+    // Convert to string if needed
+    url = String(url);
+    
+    // If it's a hash-only change, allow it
+    if (url.startsWith('#')) {
+      originalMethod(url);
+      return;
+    }
+    
+    // If already a gateway URL, allow it
+    if (url.includes('/go/') || url.includes('/go-ssr/')) {
+      console.log('[Gateway Bootstrap] Location nav already tokenized, allowing');
+      originalMethod(url);
+      return;
+    }
+    
+    // Check if tokenizeUrl is ready
+    if (!_locationNavReady) {
+      console.log('[Gateway Bootstrap] Queuing location nav until ready');
+      _pendingLocationNavs.push({ url: url, method: originalMethod });
+      return;
+    }
+    
+    // Resolve relative URL against original base
+    var baseForResolve = ORIGINAL_BASE_URL || window._gatewayOriginalUrl || 'about:blank';
+    var resolvedUrl;
+    try {
+      resolvedUrl = new URL(url, baseForResolve).href;
+    } catch (e) {
+      console.warn('[Gateway Bootstrap] Could not resolve location URL:', url);
+      originalMethod(url);
+      return;
+    }
+    
+    console.log('[Gateway Bootstrap] Location nav resolved to:', resolvedUrl?.substring(0, 100));
+    
+    // Tokenize and navigate
+    tokenizeUrl(resolvedUrl).then(function(token) {
+      if (token) {
+        var gatewayUrl = GATEWAY_BASE + '/go/' + token;
+        console.log('[Gateway Bootstrap] Location nav tokenized, navigating to:', gatewayUrl);
+        originalMethod(gatewayUrl);
+      } else {
+        console.error('[Gateway Bootstrap] Location nav tokenization failed, navigating anyway:', resolvedUrl);
+        // Navigate to original - will likely 404 but better than nothing
+        originalMethod(resolvedUrl);
+      }
+    }).catch(function(err) {
+      console.error('[Gateway Bootstrap] Location nav error:', err);
+      originalMethod(resolvedUrl);
+    });
+  }
+  
+  // Intercept direct window.location.href assignments
+  // This is tricky because we can't override window.location itself
+  // But we CAN intercept when code does: location.href = 'url' or location = 'url'
+  (function() {
+    // Store original location for later use
+    var origLocation = window.location;
+    var origHref = Object.getOwnPropertyDescriptor(window.Location.prototype, 'href');
+    
+    if (origHref && origHref.set) {
+      Object.defineProperty(window.Location.prototype, 'href', {
+        get: origHref.get,
+        set: function(value) {
+          console.log('[Gateway Bootstrap] location.href setter intercepted:', value?.substring?.(0, 100) || value);
+          
+          // If it's already a gateway URL (including SSR) or hash change, allow it
+          if (!value || String(value).startsWith('#') || String(value).includes('/go/') || String(value).includes('/go-ssr/')) {
+            return origHref.set.call(this, value);
+          }
+          
+          // Otherwise tokenize and navigate
+          handleLocationNavigation(value, function(url) {
+            origHref.set.call(origLocation, url);
+          });
+        },
+        configurable: true,
+        enumerable: true
+      });
+      console.log('[Gateway Bootstrap] location.href setter override installed');
+    } else {
+      console.warn('[Gateway Bootstrap] Could not override location.href - origHref.set not available');
+    }
+    
+    // Also intercept Location.prototype.assign and replace
+    var origAssign = window.Location.prototype.assign;
+    var origReplace = window.Location.prototype.replace;
+    
+    window.Location.prototype.assign = function(url) {
+      console.log('[Gateway Bootstrap] Location.prototype.assign intercepted:', url);
+      handleLocationNavigation(url, origAssign.bind(origLocation));
+    };
+    
+    window.Location.prototype.replace = function(url) {
+      console.log('[Gateway Bootstrap] Location.prototype.replace intercepted:', url);
+      handleLocationNavigation(url, origReplace.bind(origLocation));
+    };
+    
+    console.log('[Gateway Bootstrap] Location navigation interception installed');
+  })();
   
   // Comprehensive stub for TCF/CMP APIs used by consent management libraries.
   // Many third-party consent managers expect these globals to exist; when
@@ -366,6 +492,13 @@ function generateBootstrapScript(gatewayBase, sessionToken, pageToken, options =
   const PAGE_TOKEN = ${JSON.stringify(pageToken || null)};
   // ORIGINAL_BASE_URL already declared above for URL spoofing
   const TOKEN_CACHE = new Map();
+  
+  // Store page token in cookie for catch-all fallback recovery
+  if (PAGE_TOKEN) {
+    try {
+      document.cookie = 'gatewayToken=' + PAGE_TOKEN + '; path=/; SameSite=Lax';
+    } catch (e) {}
+  }
   
   // Debug logging helper - COMPREHENSIVE MODE
   const DEBUG_BOOTSTRAP = true;
@@ -524,6 +657,16 @@ function generateBootstrapScript(gatewayBase, sessionToken, pageToken, options =
     return promise;
   }
   
+  // Mark location navigation as ready and process any pending navigations
+  _locationNavReady = true;
+  if (_pendingLocationNavs.length > 0) {
+    console.log('[Gateway Bootstrap] Processing', _pendingLocationNavs.length, 'pending location navigations');
+    _pendingLocationNavs.forEach(function(nav) {
+      handleLocationNavigation(nav.url, nav.method);
+    });
+    _pendingLocationNavs = [];
+  }
+  
   // Convert URL to gateway path
   function toGatewayUrl(token) {
     return GATEWAY_BASE + '/go/' + token;
@@ -662,7 +805,7 @@ function generateBootstrapScript(gatewayBase, sessionToken, pageToken, options =
     return originalXHROpen.apply(this, arguments);
   };
   
-  XMLHttpRequest.prototype.send = async function(body) {
+  XMLHttpRequest.prototype.send = function(body) {
     const xhr = this;
     let url = this._gatewayUrl;
     
@@ -673,13 +816,22 @@ function generateBootstrapScript(gatewayBase, sessionToken, pageToken, options =
       // Fix any localhost URLs
       url = fixLocalhostUrl(url);
       
-      const token = await tokenizeUrl(url);
-      
-      if (token) {
-        const newUrl = toGatewayUrl(token);
-        originalXHROpen.call(xhr, xhr._gatewayMethod, newUrl, xhr._gatewayAsync);
-        xhr.setRequestHeader('Authorization', 'Bearer ' + SESSION_TOKEN);
-      }
+      // Use async IIFE to tokenize without making send async
+      (async function() {
+        try {
+          const token = await tokenizeUrl(url);
+          if (token) {
+            const newUrl = toGatewayUrl(token);
+            originalXHROpen.call(xhr, xhr._gatewayMethod, newUrl, xhr._gatewayAsync);
+            xhr.setRequestHeader('Authorization', 'Bearer ' + SESSION_TOKEN);
+          }
+          originalXHRSend.call(xhr, body);
+        } catch (err) {
+          console.warn('[Gateway] XHR tokenization failed:', err);
+          originalXHRSend.call(xhr, body);
+        }
+      })();
+      return; // Return undefined synchronously as expected
     }
     
     return originalXHRSend.call(xhr, body);
@@ -740,35 +892,339 @@ function generateBootstrapScript(gatewayBase, sessionToken, pageToken, options =
     }
   })();
   
-  // Intercept link clicks
-  document.addEventListener('click', async function(e) {
-    const link = e.target.closest('a[href]');
-    if (!link) return;
+  // Intercept video src property for dynamic video URLs (TikTok, etc.)
+  (function() {
+    var videoSrcDescriptor = Object.getOwnPropertyDescriptor(HTMLVideoElement.prototype, 'src');
     
+    if (videoSrcDescriptor && videoSrcDescriptor.set) {
+      var originalVideoSrcSetter = videoSrcDescriptor.set;
+      
+      Object.defineProperty(HTMLVideoElement.prototype, 'src', {
+        get: videoSrcDescriptor.get,
+        set: function(value) {
+          if (value && needsTokenization(value)) {
+            var baseForResolve = ORIGINAL_BASE_URL || window.location.href;
+            var resolvedUrl = new URL(value, baseForResolve).href;
+            resolvedUrl = fixLocalhostUrl(resolvedUrl);
+            
+            console.log('[Gateway] Intercepting video src:', resolvedUrl.substring(0, 80));
+            
+            // Tokenize and set
+            var video = this;
+            tokenizeUrl(resolvedUrl).then(function(token) {
+              if (token) {
+                originalVideoSrcSetter.call(video, toGatewayUrl(token));
+              } else {
+                console.warn('[Gateway] Video tokenization failed for:', resolvedUrl.substring(0, 80));
+                // Set original URL as fallback
+                originalVideoSrcSetter.call(video, value);
+              }
+            }).catch(function(err) {
+              console.warn('[Gateway] Video tokenization error:', err);
+              originalVideoSrcSetter.call(video, value);
+            });
+            return;
+          }
+          originalVideoSrcSetter.call(this, value);
+        },
+        configurable: true,
+        enumerable: true
+      });
+    }
+  })();
+  
+  // Intercept audio src property
+  (function() {
+    var audioSrcDescriptor = Object.getOwnPropertyDescriptor(HTMLAudioElement.prototype, 'src');
+    
+    if (audioSrcDescriptor && audioSrcDescriptor.set) {
+      var originalAudioSrcSetter = audioSrcDescriptor.set;
+      
+      Object.defineProperty(HTMLAudioElement.prototype, 'src', {
+        get: audioSrcDescriptor.get,
+        set: function(value) {
+          if (value && needsTokenization(value)) {
+            var baseForResolve = ORIGINAL_BASE_URL || window.location.href;
+            var resolvedUrl = new URL(value, baseForResolve).href;
+            resolvedUrl = fixLocalhostUrl(resolvedUrl);
+            
+            console.log('[Gateway] Intercepting audio src:', resolvedUrl.substring(0, 80));
+            
+            var audio = this;
+            tokenizeUrl(resolvedUrl).then(function(token) {
+              if (token) {
+                originalAudioSrcSetter.call(audio, toGatewayUrl(token));
+              } else {
+                originalAudioSrcSetter.call(audio, value);
+              }
+            }).catch(function() {
+              originalAudioSrcSetter.call(audio, value);
+            });
+            return;
+          }
+          originalAudioSrcSetter.call(this, value);
+        },
+        configurable: true,
+        enumerable: true
+      });
+    }
+  })();
+  
+  // Intercept source element src property (for <source> inside <video>/<audio>)
+  (function() {
+    var sourceSrcDescriptor = Object.getOwnPropertyDescriptor(HTMLSourceElement.prototype, 'src');
+    
+    if (sourceSrcDescriptor && sourceSrcDescriptor.set) {
+      var originalSourceSrcSetter = sourceSrcDescriptor.set;
+      
+      Object.defineProperty(HTMLSourceElement.prototype, 'src', {
+        get: sourceSrcDescriptor.get,
+        set: function(value) {
+          if (value && needsTokenization(value)) {
+            var baseForResolve = ORIGINAL_BASE_URL || window.location.href;
+            var resolvedUrl = new URL(value, baseForResolve).href;
+            resolvedUrl = fixLocalhostUrl(resolvedUrl);
+            
+            console.log('[Gateway] Intercepting source src:', resolvedUrl.substring(0, 80));
+            
+            var source = this;
+            tokenizeUrl(resolvedUrl).then(function(token) {
+              if (token) {
+                originalSourceSrcSetter.call(source, toGatewayUrl(token));
+                // Reload parent media element
+                var parent = source.parentElement;
+                if (parent && (parent.tagName === 'VIDEO' || parent.tagName === 'AUDIO')) {
+                  parent.load();
+                }
+              } else {
+                originalSourceSrcSetter.call(source, value);
+              }
+            }).catch(function() {
+              originalSourceSrcSetter.call(source, value);
+            });
+            return;
+          }
+          originalSourceSrcSetter.call(this, value);
+        },
+        configurable: true,
+        enumerable: true
+      });
+    }
+  })();
+  
+  // Intercept setAttribute for video/audio/source elements
+  (function() {
+    var originalSetAttribute = Element.prototype.setAttribute;
+    Element.prototype.setAttribute = function(name, value) {
+      var lowerName = name.toLowerCase();
+      
+      // Check if setting src on video/audio/source elements
+      if (lowerName === 'src' && value && needsTokenization(value)) {
+        var tagName = this.tagName;
+        if (tagName === 'VIDEO' || tagName === 'AUDIO' || tagName === 'SOURCE' || 
+            tagName === 'SCRIPT' || tagName === 'IFRAME' || tagName === 'IMG') {
+          var baseForResolve = ORIGINAL_BASE_URL || window.location.href;
+          var resolvedUrl = new URL(value, baseForResolve).href;
+          resolvedUrl = fixLocalhostUrl(resolvedUrl);
+          
+          console.log('[Gateway] Intercepting setAttribute src on ' + tagName + ':', resolvedUrl.substring(0, 80));
+          
+          var elem = this;
+          tokenizeUrl(resolvedUrl).then(function(token) {
+            if (token) {
+              originalSetAttribute.call(elem, name, toGatewayUrl(token));
+              // Reload parent media element if source
+              if (tagName === 'SOURCE') {
+                var parent = elem.parentElement;
+                if (parent && (parent.tagName === 'VIDEO' || parent.tagName === 'AUDIO')) {
+                  parent.load();
+                }
+              }
+            } else {
+              originalSetAttribute.call(elem, name, value);
+            }
+          }).catch(function() {
+            originalSetAttribute.call(elem, name, value);
+          });
+          return;
+        }
+      }
+      
+      // Check if setting poster on video elements
+      if (lowerName === 'poster' && value && needsTokenization(value) && this.tagName === 'VIDEO') {
+        var baseForResolve = ORIGINAL_BASE_URL || window.location.href;
+        var resolvedUrl = new URL(value, baseForResolve).href;
+        resolvedUrl = fixLocalhostUrl(resolvedUrl);
+        
+        var elem = this;
+        tokenizeUrl(resolvedUrl).then(function(token) {
+          if (token) {
+            originalSetAttribute.call(elem, name, toGatewayUrl(token));
+          } else {
+            originalSetAttribute.call(elem, name, value);
+          }
+        }).catch(function() {
+          originalSetAttribute.call(elem, name, value);
+        });
+        return;
+      }
+      
+      return originalSetAttribute.call(this, name, value);
+    };
+  })();
+  
+  // ============================================================================
+  // Safari/iOS Compatibility
+  // ============================================================================
+  
+  // Detect Safari/iOS
+  var isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+  var isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || 
+              (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  
+  console.log('[Gateway] Browser detection - Safari:', isSafari, 'iOS:', isIOS);
+  
+  // Safari doesn't support MediaSource Extensions well - intercept and handle
+  if (isIOS || isSafari) {
+    // For iOS Safari, we need to ensure videos are set up correctly
+    // iOS requires user interaction to play videos, so we track interaction state
+    var hasUserInteracted = false;
+    
+    document.addEventListener('touchstart', function() {
+      hasUserInteracted = true;
+    }, { once: true, passive: true });
+    
+    document.addEventListener('click', function() {
+      hasUserInteracted = true;
+    }, { once: true, passive: true });
+    
+    // Ensure all video elements have required iOS attributes
+    function setupVideoForIOS(video) {
+      if (!video || video._iosSetup) return;
+      video._iosSetup = true;
+      
+      // Required for inline playback on iOS
+      video.setAttribute('playsinline', '');
+      video.setAttribute('webkit-playsinline', '');
+      
+      // CORS setup
+      if (!video.hasAttribute('crossorigin')) {
+        video.setAttribute('crossorigin', 'anonymous');
+      }
+      
+      // If autoplay is set, ensure muted for iOS autoplay policy
+      if (video.hasAttribute('autoplay')) {
+        video.muted = true;
+      }
+      
+      console.log('[Gateway iOS] Video configured for iOS playback');
+    }
+    
+    // Apply to all existing videos
+    document.querySelectorAll('video').forEach(setupVideoForIOS);
+    
+    // Watch for new videos
+    var videoObserver = new MutationObserver(function(mutations) {
+      mutations.forEach(function(mutation) {
+        mutation.addedNodes.forEach(function(node) {
+          if (node.nodeType === 1) {
+            if (node.tagName === 'VIDEO') {
+              setupVideoForIOS(node);
+            }
+            // Also check descendants
+            if (node.querySelectorAll) {
+              node.querySelectorAll('video').forEach(setupVideoForIOS);
+            }
+          }
+        });
+      });
+    });
+    
+    if (document.body) {
+      videoObserver.observe(document.body, { childList: true, subtree: true });
+    } else {
+      document.addEventListener('DOMContentLoaded', function() {
+        document.querySelectorAll('video').forEach(setupVideoForIOS);
+        videoObserver.observe(document.body, { childList: true, subtree: true });
+      });
+    }
+  }
+  
+  // Intercept blob URL creation to track video blobs
+  (function() {
+    var originalCreateObjectURL = URL.createObjectURL;
+    var originalRevokeObjectURL = URL.revokeObjectURL;
+    var blobUrlMap = new Map();
+    
+    URL.createObjectURL = function(blob) {
+      var url = originalCreateObjectURL.call(URL, blob);
+      
+      // Track blob URLs for debugging
+      if (blob && blob.type && blob.type.startsWith('video/')) {
+        console.log('[Gateway] Video blob URL created:', url, 'type:', blob.type, 'size:', blob.size);
+        blobUrlMap.set(url, { type: blob.type, size: blob.size });
+      }
+      
+      return url;
+    };
+    
+    URL.revokeObjectURL = function(url) {
+      if (blobUrlMap.has(url)) {
+        console.log('[Gateway] Video blob URL revoked:', url);
+        blobUrlMap.delete(url);
+      }
+      return originalRevokeObjectURL.call(URL, url);
+    };
+  })();
+  
+  // ============================================================================
+  // Click and Touch Event Handling
+  // ============================================================================
+  
+  // Helper function to handle link navigation (shared between click and touch)
+  async function handleLinkNavigation(link, e) {
     const href = link.getAttribute('href');
-    if (!needsTokenization(href)) return;
+    
+    debugLog('[NAV] Link activated:', {
+      href: href?.substring(0, 100),
+      needsTokenization: needsTokenization(href),
+      alreadyHasGo: href?.includes('/go/'),
+      target: link.target || 'none'
+    });
+    
+    if (!needsTokenization(href)) {
+      debugLog('[NAV] Skipping - does not need tokenization');
+      return false; // Don't prevent default
+    }
     
     // Already handled by server-side rewriting in most cases
-    // This is a fallback for dynamically added links
     if (!href.includes('/go/')) {
+      debugLog('[NAV] Intercepting - needs tokenization');
       e.preventDefault();
       e.stopPropagation();
       
       // Resolve relative URL against original base if available
       const baseForResolve = ORIGINAL_BASE_URL || window.location.href;
-      let resolvedUrl = new URL(href, baseForResolve).href;
-      resolvedUrl = fixLocalhostUrl(resolvedUrl);
+      let resolvedUrl;
+      try {
+        resolvedUrl = new URL(href, baseForResolve).href;
+        resolvedUrl = fixLocalhostUrl(resolvedUrl);
+      } catch (urlErr) {
+        debugError('[NAV] URL resolution failed:', urlErr.message, { href, baseForResolve });
+        return true; // Prevented
+      }
+      
+      debugLog('[NAV] Resolved URL:', resolvedUrl?.substring(0, 100));
       
       const token = await tokenizeUrl(resolvedUrl);
       
       if (token) {
         const targetUrl = toGatewayUrl(token);
+        debugLog('[NAV] Navigating to tokenized URL:', targetUrl);
         // Preserve target attribute
         if (link.target === '_blank') {
           window.open(targetUrl, '_blank');
         } else {
-          // Use top-level navigation to avoid nested proxy scenarios
-          // when running inside an iframe or sandbox context
           try {
             if (window.top && window.top !== window) {
               window.top.location.href = targetUrl;
@@ -776,12 +1232,59 @@ function generateBootstrapScript(gatewayBase, sessionToken, pageToken, options =
               window.location.href = targetUrl;
             }
           } catch (crossOriginErr) {
-            // If cross-origin, just navigate current window
             window.location.href = targetUrl;
           }
         }
+      } else {
+        debugError('[NAV] Tokenization failed for:', resolvedUrl?.substring(0, 100));
       }
+      return true; // Prevented
     }
+    
+    debugLog('[NAV] Link already has /go/ token, allowing default');
+    return false; // Don't prevent default
+  }
+  
+  // Touch event handling for Safari/iOS (fires before click on touch devices)
+  // This is important because Safari can have 300ms click delay
+  var touchHandledLinks = new WeakSet();
+  
+  document.addEventListener('touchend', async function(e) {
+    // Only handle single-finger taps
+    if (e.changedTouches.length !== 1) return;
+    
+    const touch = e.changedTouches[0];
+    const target = document.elementFromPoint(touch.clientX, touch.clientY);
+    if (!target) return;
+    
+    const link = target.closest('a[href]');
+    if (!link) return;
+    
+    // Mark this link as handled by touch to avoid double-handling in click
+    touchHandledLinks.add(link);
+    
+    // Handle the navigation
+    const prevented = await handleLinkNavigation(link, e);
+    
+    // Clear the marker after a short delay
+    setTimeout(function() {
+      touchHandledLinks.delete(link);
+    }, 500);
+  }, { passive: false, capture: true });
+  
+  // Intercept link clicks (desktop and as fallback)
+  document.addEventListener('click', async function(e) {
+    const link = e.target.closest('a[href]');
+    if (!link) return;
+    
+    // Skip if already handled by touch event
+    if (touchHandledLinks.has(link)) {
+      debugLog('[CLICK] Skipping - already handled by touch');
+      e.preventDefault();
+      return;
+    }
+    
+    await handleLinkNavigation(link, e);
   }, true);
   
   // Intercept form submissions
@@ -801,26 +1304,143 @@ function generateBootstrapScript(gatewayBase, sessionToken, pageToken, options =
       
       if (token) {
         form.setAttribute('action', toGatewayUrl(token));
-        // Re-submit
-        form.submit();
+        // Re-submit using original submit to avoid infinite loop
+        originalFormSubmit.call(form);
       }
     }
   }, true);
   
-  // Override window.open to tokenize URLs
-  const originalWindowOpen = window.open;
-  window.open = async function(url, target, features) {
-    if (url && needsTokenization(url)) {
-      const resolvedUrl = new URL(url, window.location.href).href;
-      const token = await tokenizeUrl(resolvedUrl);
-      if (token) {
-        return originalWindowOpen.call(window, toGatewayUrl(token), target, features);
+  // Override HTMLFormElement.prototype.submit to intercept programmatic form submissions
+  // 
+  // IMPORTANT: Async behavior note
+  // -----------------------------
+  // This override makes form.submit() behave asynchronously when the form action
+  // requires tokenization. Code calling form.submit() will return BEFORE the form
+  // is actually submitted. This differs from the standard synchronous behavior.
+  // 
+  // This is an unavoidable constraint because:
+  // 1. HTMLFormElement.prototype.submit cannot return a Promise (API contract)
+  // 2. URL tokenization requires an async fetch to the gateway server
+  // 
+  // Security note: On tokenization failure, we intentionally BLOCK submission
+  // rather than falling back to the untokenized URL, which would bypass the proxy.
+  //
+  var originalFormSubmit = HTMLFormElement.prototype.submit;
+  HTMLFormElement.prototype.submit = function() {
+    var form = this;
+    var action = form.getAttribute('action') || form.action || '';
+    
+    console.log('[Gateway Bootstrap] Form.submit() intercepted:', action?.substring?.(0, 100) || action);
+    
+    if (action && needsTokenization(action) && !String(action).includes('/go/') && !String(action).includes('/go-ssr/')) {
+      // Resolve relative URL against original base if available
+      var baseForResolve = ORIGINAL_BASE_URL || window.location.href;
+      var resolvedUrl;
+      try {
+        resolvedUrl = new URL(action, baseForResolve).href;
+        resolvedUrl = fixLocalhostUrl(resolvedUrl);
+      } catch (e) {
+        console.warn('[Gateway Bootstrap] Form action URL parse failed:', e.message);
+        // Block submission on parse failure - don't bypass proxy
+        showFormSubmissionError(form, 'Invalid form action URL');
+        return;
       }
+      
+      console.log('[Gateway Bootstrap] Form.submit() tokenizing:', resolvedUrl?.substring(0, 100));
+      
+      // Tokenize and then submit
+      tokenizeUrl(resolvedUrl).then(function(token) {
+        if (token) {
+          form.setAttribute('action', toGatewayUrl(token));
+          console.log('[Gateway Bootstrap] Form.submit() navigating to tokenized:', toGatewayUrl(token));
+          originalFormSubmit.call(form);
+        } else {
+          // SECURITY: Block submission on tokenization failure
+          // Submitting with untokenized URL would bypass the proxy entirely
+          console.error('[Gateway Bootstrap] Form.submit() BLOCKED - tokenization failed for:', resolvedUrl?.substring(0, 100));
+          showFormSubmissionError(form, 'Form submission failed - please try again');
+        }
+      }).catch(function(err) {
+        // SECURITY: Block submission on error - don't bypass proxy
+        console.error('[Gateway Bootstrap] Form.submit() BLOCKED - tokenization error:', err);
+        showFormSubmissionError(form, 'Form submission failed - please try again');
+      });
+      return; // Don't submit yet, wait for tokenization (async behavior)
+    }
+    
+    return originalFormSubmit.call(form);
+  };
+  
+  // Helper to show user-visible error when form submission is blocked
+  function showFormSubmissionError(form, message) {
+    // Try to find or create an error display element
+    var errorId = 'gateway-form-error-' + Math.random().toString(36).substring(2, 11);
+    var errorEl = document.createElement('div');
+    errorEl.id = errorId;
+    errorEl.style.cssText = 'background:#fee;border:1px solid #c00;color:#c00;padding:10px;margin:10px 0;border-radius:4px;font-family:sans-serif;';
+    errorEl.textContent = message;
+    
+    // Insert error message before the form or append to body as fallback
+    try {
+      if (form.parentNode) {
+        form.parentNode.insertBefore(errorEl, form);
+      } else if (document && document.body) {
+        document.body.appendChild(errorEl);
+      } else if (document && document.documentElement) {
+        document.documentElement.appendChild(errorEl);
+      } else {
+        throw new Error('No valid DOM container available');
+      }
+      // Auto-remove after 5 seconds
+      setTimeout(function() {
+        var el = document.getElementById(errorId);
+        if (el && el.parentNode) {
+          el.parentNode.removeChild(el);
+        }
+      }, 5000);
+    } catch (e) {
+      // Fallback to alert if DOM manipulation fails
+      console.error('[Gateway Bootstrap] Could not display form error:', e);
+      alert('Form submission failed: ' + message);
+    }
+  }
+  
+  // Override window.open to tokenize URLs (synchronous to return Window immediately)
+  const originalWindowOpen = window.open;
+  window.open = function(url, target, features) {
+    if (url && needsTokenization(url)) {
+      // Try to parse URL before opening popup to avoid orphaned windows on malformed URLs
+      let resolvedUrl;
+      try {
+        resolvedUrl = new URL(url, window.location.href).href;
+      } catch (parseErr) {
+        console.warn('[Gateway] window.open URL parse failed:', parseErr.message, url?.substring?.(0, 100));
+        // Fall back to original behavior for malformed URLs
+        return originalWindowOpen.call(window, url, target, features);
+      }
+      
+      // URL parsed successfully, now open about:blank to return a Window synchronously
+      const popup = originalWindowOpen.call(window, 'about:blank', target, features);
+      // Asynchronously tokenize and navigate
+      tokenizeUrl(resolvedUrl).then(function(token) {
+        if (token && popup && !popup.closed) {
+          popup.location.href = toGatewayUrl(token);
+        } else if (popup && !popup.closed) {
+          // Fallback: navigate to original URL if tokenization failed
+          popup.location.href = url;
+        }
+      }).catch(function(err) {
+        console.warn('[Gateway] window.open tokenization failed:', err);
+        if (popup && !popup.closed) {
+          popup.location.href = url;
+        }
+      });
+      return popup;
     }
     return originalWindowOpen.call(window, url, target, features);
   };
   
-  // Handle dynamically added scripts and iframes
+  // Handle dynamically added scripts, iframes, videos, and source elements
   const observer = new MutationObserver(function(mutations) {
     mutations.forEach(function(mutation) {
       mutation.addedNodes.forEach(function(node) {
@@ -842,6 +1462,59 @@ function generateBootstrapScript(gatewayBase, sessionToken, pageToken, options =
           tokenizeUrl(resolvedUrl).then(function(token) {
             if (token) {
               node.src = toGatewayUrl(token);
+            }
+          });
+        }
+        
+        // Handle dynamically added video elements
+        if (node.tagName === 'VIDEO' && node.src && needsTokenization(node.src)) {
+          const resolvedUrl = new URL(node.src, window.location.href).href;
+          console.log('[Gateway] MutationObserver: video src detected:', resolvedUrl.substring(0, 80));
+          tokenizeUrl(resolvedUrl).then(function(token) {
+            if (token) {
+              node.src = toGatewayUrl(token);
+            }
+          });
+        }
+        
+        // Handle dynamically added audio elements
+        if (node.tagName === 'AUDIO' && node.src && needsTokenization(node.src)) {
+          const resolvedUrl = new URL(node.src, window.location.href).href;
+          tokenizeUrl(resolvedUrl).then(function(token) {
+            if (token) {
+              node.src = toGatewayUrl(token);
+            }
+          });
+        }
+        
+        // Handle dynamically added source elements (inside video/audio)
+        if (node.tagName === 'SOURCE' && node.src && needsTokenization(node.src)) {
+          const resolvedUrl = new URL(node.src, window.location.href).href;
+          console.log('[Gateway] MutationObserver: source src detected:', resolvedUrl.substring(0, 80));
+          tokenizeUrl(resolvedUrl).then(function(token) {
+            if (token) {
+              node.src = toGatewayUrl(token);
+              // Reload parent media element
+              var parent = node.parentElement;
+              if (parent && (parent.tagName === 'VIDEO' || parent.tagName === 'AUDIO')) {
+                parent.load();
+              }
+            }
+          });
+        }
+        
+        // Also check for source children inside newly added video/audio elements
+        if (node.tagName === 'VIDEO' || node.tagName === 'AUDIO') {
+          var sources = node.querySelectorAll('source[src]');
+          sources.forEach(function(source) {
+            if (needsTokenization(source.src)) {
+              const resolvedUrl = new URL(source.src, window.location.href).href;
+              tokenizeUrl(resolvedUrl).then(function(token) {
+                if (token) {
+                  source.src = toGatewayUrl(token);
+                  node.load();
+                }
+              });
             }
           });
         }
@@ -972,6 +1645,30 @@ function rewriteHtml(html, baseUrl, tokenizeUrlSync, options = {}) {
     }
   });
   
+  // Add Safari/iOS video compatibility attributes
+  $('video').each((i, elem) => {
+    const $elem = $(elem);
+    // Required for iOS inline playback (not fullscreen)
+    $elem.attr('playsinline', '');
+    $elem.attr('webkit-playsinline', '');
+    // Allow autoplay on iOS (muted videos can autoplay)
+    if ($elem.attr('autoplay') !== undefined) {
+      $elem.attr('muted', '');
+    }
+    // Add cross-origin for CORS
+    if (!$elem.attr('crossorigin')) {
+      $elem.attr('crossorigin', 'anonymous');
+    }
+  });
+  
+  // Add Safari/iOS meta tags for proper viewport and web app behavior
+  const safariMeta = `
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="format-detection" content="telephone=no">
+  `;
+  
   // Inject bootstrap script into <head>
   if (gatewayBase && sessionToken) {
     const bootstrapScript = generateBootstrapScript(
@@ -982,6 +1679,10 @@ function rewriteHtml(html, baseUrl, tokenizeUrlSync, options = {}) {
     );
     
     if (hasHead) {
+      // Check if viewport meta exists, if not add Safari meta
+      if (!$('meta[name="viewport"]').length) {
+        $('head').prepend(safariMeta);
+      }
       $('head').prepend(bootstrapScript);
     } else {
       // No head tag, prepend to body or html

@@ -2,7 +2,11 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="format-detection" content="telephone=no">
+  <meta name="mobile-web-app-capable" content="yes">
   <title>Encrypted Link Gateway - Browser</title>
   <style>
     :root {
@@ -16,12 +20,19 @@
       --error: #ef4444;
       --warning: #f59e0b;
       --border: #334155;
+      /* Safe area insets for notched devices */
+      --safe-area-top: env(safe-area-inset-top, 0px);
+      --safe-area-bottom: env(safe-area-inset-bottom, 0px);
+      --safe-area-left: env(safe-area-inset-left, 0px);
+      --safe-area-right: env(safe-area-inset-right, 0px);
     }
     
     * {
       box-sizing: border-box;
       margin: 0;
       padding: 0;
+      /* Prevent iOS text size adjustment */
+      -webkit-text-size-adjust: 100%;
     }
     
     body {
@@ -29,8 +40,23 @@
       background: var(--bg);
       color: var(--text);
       min-height: 100vh;
+      min-height: -webkit-fill-available; /* iOS Safari fix */
       display: flex;
       flex-direction: column;
+      /* Prevent pull-to-refresh on iOS */
+      overscroll-behavior-y: contain;
+      /* Smooth scrolling on iOS */
+      -webkit-overflow-scrolling: touch;
+      /* Account for safe areas */
+      padding-top: var(--safe-area-top);
+      padding-bottom: var(--safe-area-bottom);
+      padding-left: var(--safe-area-left);
+      padding-right: var(--safe-area-right);
+    }
+    
+    /* Fix for iOS 100vh issue */
+    html {
+      height: -webkit-fill-available;
     }
     
     .toolbar {
@@ -41,6 +67,8 @@
       gap: 0.75rem;
       align-items: center;
       flex-wrap: wrap;
+      /* Prevent sticky hover on touch */
+      -webkit-tap-highlight-color: transparent;
     }
     
     .toolbar-section {
@@ -62,8 +90,11 @@
       border-radius: 6px;
       padding: 0.5rem 0.75rem;
       color: var(--text);
-      font-size: 0.875rem;
+      font-size: 1rem; /* Prevent iOS zoom on focus */
       min-width: 200px;
+      /* Prevent iOS input styling */
+      -webkit-appearance: none;
+      appearance: none;
     }
     
     .toolbar input:focus {
@@ -80,16 +111,37 @@
       background: var(--primary);
       color: white;
       border: none;
-      padding: 0.5rem 1rem;
+      padding: 0.75rem 1.25rem; /* Larger touch target for iPad */
       border-radius: 6px;
-      font-size: 0.875rem;
+      font-size: 1rem;
       cursor: pointer;
       transition: background 0.2s;
       white-space: nowrap;
+      /* Touch-friendly */
+      -webkit-tap-highlight-color: transparent;
+      touch-action: manipulation;
+      /* Minimum 44px touch target for iOS */
+      min-height: 44px;
+      min-width: 44px;
     }
     
     button:hover {
       background: var(--primary-dark);
+    }
+    
+    /* Remove sticky hover on touch devices */
+    @media (hover: none) {
+      button:hover {
+        background: var(--primary);
+      }
+      .btn-secondary:hover {
+        background: transparent;
+      }
+    }
+    
+    button:active {
+      background: var(--primary-dark);
+      transform: scale(0.98);
     }
     
     button:disabled {
@@ -151,6 +203,16 @@
       border: none;
       width: 100%;
       height: 100%;
+      /* Safari iframe fixes */
+      -webkit-overflow-scrolling: touch;
+      overflow: auto;
+    }
+    
+    /* Fullscreen video support for iPad */
+    .browser-frame iframe:fullscreen,
+    .browser-frame iframe:-webkit-full-screen {
+      width: 100vw;
+      height: 100vh;
     }
     
     .welcome-screen {
@@ -287,7 +349,7 @@
     
     <div class="toolbar-section" style="flex: 1;">
       <label>Browse:</label>
-      <input type="text" id="target-url" class="url-input" value="https://mojhheh.gtihub.io" placeholder="https://mojhheh.gtihub.io" disabled>
+      <input type="text" id="target-url" class="url-input" value="https://mojhheh.github.io" placeholder="https://mojhheh.github.io" disabled>
       <button id="go-btn" onclick="browse()" disabled>Go</button>
     </div>
     
@@ -307,7 +369,7 @@
         <ol>
           <li>Gateway URL is set to <code>http://localhost:3000</code></li>
           <li>Click <strong>Connect</strong> to establish a session</li>
-          <li>Enter a URL (default: <code>https://mojhheh.gtihub.io</code>)</li>
+          <li>Enter a URL (default: <code>https://mojhheh.github.io</code>)</li>
           <li>Click <strong>Go</strong> to view the site through the gateway</li>
         </ol>
       </div>
@@ -478,8 +540,8 @@
         contentFrame.style.display = 'block';
         
         // Load content via iframe src (not srcdoc) for proper origin and click handling
-        // Remove sandbox entirely for full functionality
-        contentFrame.removeAttribute('sandbox');
+        // Set controlled sandbox - avoid allow-top-navigation and allow-same-origin for security
+        contentFrame.setAttribute('sandbox', 'allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-presentation allow-modals');
         contentFrame.src = gatewayUrl;
         
         log(`Loaded ${url} through gateway`, 'success');
@@ -487,7 +549,14 @@
       } catch (e) {
         log(`Browse failed: ${e.message}`, 'error');
         
-        // Show error in frame
+        // Show error in frame - HTML-escape the error message to prevent XSS
+        const escapeHtml = (str) => {
+          const div = document.createElement('div');
+          div.textContent = str;
+          return div.innerHTML;
+        };
+        const safeMessage = escapeHtml(e.message || 'Unknown error');
+        
         welcomeScreen.style.display = 'none';
         contentFrame.style.display = 'block';
         contentFrame.srcdoc = `
@@ -499,7 +568,7 @@
           <body>
             <div class="error">
               <h2>Error Loading Page</h2>
-              <p>${e.message}</p>
+              <p>${safeMessage}</p>
               <p>Make sure the URL is in the gateway's allowed origins list.</p>
             </div>
           </body>

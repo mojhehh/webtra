@@ -24,7 +24,8 @@ const DEBUG_CATEGORIES = {
   FETCH: true,       // Upstream fetches
   ERROR: true,       // All errors
   CACHE: true,       // Caching operations
-  STREAM: true       // Video/audio streaming
+  STREAM: true,      // Video/audio streaming
+  TOKEN_EXPIRE: false // Token expiration/not-found (noisy on SPA sites - set true for debugging)
 };
 
 function debug(category, message, data = {}) {
@@ -337,6 +338,63 @@ function setCachedPage(url, html) {
 }
 
 // ============================================================================
+// URL Normalization for Cross-Wiki Authentication
+// ============================================================================
+
+/**
+ * Normalize Wikipedia/Wikimedia URLs that use cross-wiki auth paths
+ * Wikipedia's central auth system uses paths like /enwiki/w/... which
+ * need to be normalized to /w/... for the actual wiki to work.
+ * 
+ * Examples:
+ *   https://en.wikipedia.org/enwiki/w/index.php -> https://en.wikipedia.org/w/index.php
+ *   https://en.wikipedia.org/dewiki/w/index.php -> https://en.wikipedia.org/w/index.php
+ */
+function normalizeWikimediaUrl(url) {
+  if (!url) return url;
+  
+  try {
+    const u = new URL(url);
+    
+    // Only process Wikipedia/Wikimedia domains
+    if (!u.hostname.includes('wikipedia.org') && 
+        !u.hostname.includes('wikimedia.org') &&
+        !u.hostname.includes('wiktionary.org') &&
+        !u.hostname.includes('wikiquote.org') &&
+        !u.hostname.includes('wikibooks.org') &&
+        !u.hostname.includes('wikisource.org') &&
+        !u.hostname.includes('wikinews.org') &&
+        !u.hostname.includes('wikiversity.org') &&
+        !u.hostname.includes('wikidata.org') &&
+        !u.hostname.includes('mediawiki.org')) {
+      return url;
+    }
+    
+    // Match patterns like /enwiki/w/... or /dewiki/w/... or /frwiki/w/...
+    // These are cross-wiki central auth redirect artifacts
+    const crossWikiPattern = /^\/([a-z]{2,3}wiki)\/(.+)$/;
+    const match = u.pathname.match(crossWikiPattern);
+    
+    if (match) {
+      const [, wikiPrefix, restOfPath] = match;
+      // Normalize to just the path without the wiki prefix
+      u.pathname = '/' + restOfPath;
+      const normalizedUrl = u.toString();
+      debug('URL', 'Normalized cross-wiki URL', { 
+        original: url.substring(0, 100), 
+        normalized: normalizedUrl.substring(0, 100),
+        wikiPrefix 
+      });
+      return normalizedUrl;
+    }
+    
+    return url;
+  } catch (e) {
+    return url;
+  }
+}
+
+// ============================================================================
 // Express App Setup
 // ============================================================================
 
@@ -359,12 +417,48 @@ app.use(helmet({
 }));
 
 // CORS - Allow requests from any origin including null (sandboxed iframes)
+// Safari/iOS requires specific CORS handling
 app.use(cors({
   origin: true,  // Allow all origins including null
   credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Session-Token', 'X-Parent-Token']
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'HEAD', 'PATCH'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Session-Token', 'X-Parent-Token', 'X-Gateway-Token', 'Range', 'Accept-Encoding', 'Cache-Control'],
+  exposedHeaders: ['Content-Range', 'Accept-Ranges', 'Content-Length', 'Content-Type', 'X-Cache'],
+  maxAge: 86400, // Cache preflight for 24 hours
+  preflightContinue: false,
+  optionsSuccessStatus: 204
 }));
+
+// Additional Safari/iOS compatibility headers
+app.use((req, res, next) => {
+  // Safari requires explicit CORS headers for media
+  res.set('Cross-Origin-Resource-Policy', 'cross-origin');
+  res.set('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
+  
+  // Prevent Safari from caching CORS preflight incorrectly
+  if (req.method === 'OPTIONS') {
+    res.set('Cache-Control', 'no-store');
+  }
+  
+  next();
+});
+
+// Simple cookie parser middleware (no extra dependency needed)
+app.use((req, res, next) => {
+  req.cookies = {};
+  const cookieHeader = req.headers.cookie;
+  if (cookieHeader) {
+    cookieHeader.split(';').forEach(cookie => {
+      const parts = cookie.split('=');
+      if (parts.length >= 2) {
+        const key = parts[0].trim();
+        const value = parts.slice(1).join('=').trim();
+        req.cookies[key] = value;
+      }
+    });
+  }
+  next();
+});
 
 // Body parsing - capture raw body for proxy forwarding
 app.use(express.json({ limit: '1mb' }));
@@ -495,6 +589,22 @@ app.get('/health', (req, res) => {
       rateLimiter: rateLimiter.getStats()
     }
   });
+});
+
+/**
+ * Favicon endpoint - return empty to prevent 404 noise
+ */
+app.get('/favicon.ico', (req, res) => {
+  res.status(204).end();
+});
+
+/**
+ * Beacon/analytics endpoint - mock to prevent 404 noise from tracking scripts
+ * Wikipedia and other sites use /beacon/* for stats collection
+ */
+app.all('/beacon/*', (req, res) => {
+  debug('PROXY', 'Beacon request silently accepted', { path: req.path });
+  res.status(204).end();
 });
 
 /**
@@ -934,16 +1044,33 @@ app.all('/go/:token', rateLimiter.middleware('proxy'), async (req, res) => {
   });
   
   if (!resolution.valid) {
-    debugWarn('PROXY', 'TOKEN INVALID', {
-      reqId,
-      reason: resolution.reason,
-      tokenPreview: token?.substring(0, 16) + '...',
-      ip,
-      acceptHeader: req.get('accept')?.substring(0, 50),
-      referer: req.get('referer')?.substring(0, 80),
-      hint: 'Token may have expired (1 hour TTL) or never existed'
-    });
-    securityLogger.logBlocked('TOKEN', resolution.reason, { token: token.slice(0, 8) + '...', ip });
+    // Determine if this is an expected expiration/not-found vs unexpected error
+    const isExpectedTokenFailure = resolution.reason?.includes('not found') || 
+                                   resolution.reason?.includes('expired') ||
+                                   resolution.reason?.includes('Token not found');
+    
+    // Only log token failures if TOKEN_EXPIRE debugging is enabled, or if it's unexpected
+    if (DEBUG_CATEGORIES.TOKEN_EXPIRE || !isExpectedTokenFailure) {
+      debugWarn('PROXY', 'TOKEN INVALID', {
+        reqId,
+        reason: resolution.reason,
+        tokenPreview: token?.substring(0, 16) + '...',
+        ip,
+        acceptHeader: req.get('accept')?.substring(0, 50),
+        referer: req.get('referer')?.substring(0, 80),
+        hint: isExpectedTokenFailure ? 'Expected: token expired or single-use' : 'Unexpected token failure'
+      });
+    }
+    
+    // Only log to security logger for non-expired failures (possible attacks)
+    if (!isExpectedTokenFailure) {
+      securityLogger.logBlocked('TOKEN', resolution.reason, { token: token.slice(0, 8) + '...', ip });
+    }
+    
+    // Use 410 Gone for expired/not-found tokens (cleaner semantics - resource existed but is gone)
+    // Use 403 Forbidden for other validation failures (e.g., origin mismatch, format errors)
+    const statusCode = isExpectedTokenFailure ? 410 : 403;
+    const statusText = isExpectedTokenFailure ? 'Token expired or consumed' : resolution.reason;
     
     // Return a MIME-appropriate error so browsers don't reject scripts/styles
     const acceptHeader = req.get('accept') || '';
@@ -957,19 +1084,19 @@ app.all('/go/:token', rateLimiter.middleware('proxy'), async (req, res) => {
     
     if (wantsJS) {
       res.type('application/javascript');
-      return res.status(403).send(`// Gateway: forbidden - ${resolution.reason}`);
+      return res.status(statusCode).send(`// Gateway: ${statusText}`);
     }
     if (wantsCSS) {
       res.type('text/css');
-      return res.status(403).send(`/* Gateway: forbidden - ${resolution.reason} */`);
+      return res.status(statusCode).send(`/* Gateway: ${statusText} */`);
     }
     if (wantsImage || wantsFont) {
-      return res.status(404).send('');
+      return res.status(statusCode).send('');
     }
     if (wantsHTML) {
-      return res.status(403).type('text/html').send(`<!-- Gateway: forbidden - ${resolution.reason} -->`);
+      return res.status(statusCode).type('text/html').send(`<!-- Gateway: ${statusText} -->`);
     }
-    return res.status(403).type('text/plain').send(`Forbidden: ${resolution.reason}`);
+    return res.status(statusCode).type('text/plain').send(statusText);
   }
   
   const targetUrl = resolution.url;
@@ -1115,6 +1242,11 @@ app.all('/go/:token', rateLimiter.middleware('proxy'), async (req, res) => {
       // Wait a bit for JS to execute
       await page.waitForTimeout(1500);
       
+      // Get the FINAL URL after any redirects - critical for cross-domain SSO like Wikipedia
+      const rawFinalUrl = page.url();
+      const finalUrl = normalizeWikimediaUrl(rawFinalUrl) || rawFinalUrl;
+      debug('HTML', 'Final URL after redirects', { reqId, originalUrl: targetUrl?.substring(0, 80), rawFinalUrl: rawFinalUrl?.substring(0, 80), finalUrl: finalUrl?.substring(0, 80) });
+      
       // Get the rendered HTML
       const html = await page.content();
       
@@ -1124,10 +1256,10 @@ app.all('/go/:token', rateLimiter.middleware('proxy'), async (req, res) => {
       await page.close();
       returnContextToPool(context);
       
-      // Cache the result
-      setCachedPage(targetUrl, html);
+      // Cache the result (use finalUrl as key since that's the actual content)
+      setCachedPage(finalUrl, html);
       
-      // Rewrite and send
+      // Rewrite and send - use finalUrl as base for URL resolution
       const gatewayBase = config.gatewayBase || `${req.protocol}://${req.get('host')}`;
       const tokenizeUrlSync = (url) => {
         try {
@@ -1136,7 +1268,7 @@ app.all('/go/:token', rateLimiter.middleware('proxy'), async (req, res) => {
         } catch { return url; }
       };
       
-      const rewrittenHtml = rewriteHtml(html, targetUrl, tokenizeUrlSync, {
+      const rewrittenHtml = rewriteHtml(html, finalUrl, tokenizeUrlSync, {
         gatewayBase,
         sessionToken: resolution.sessionId || 'anonymous',
         pageToken: token
@@ -1192,6 +1324,12 @@ app.all('/go/:token', rateLimiter.middleware('proxy'), async (req, res) => {
     // Only strip our gateway's session token if present
     // delete headers.authorization;
     // delete headers.Authorization;
+    
+    // Explicitly forward Range header for Safari/iOS video seeking
+    if (req.headers.range) {
+      headers['range'] = req.headers.range;
+      debug('PROXY', 'Forwarding Range header for media seeking', { range: req.headers.range });
+    }
     
     const agent = targetUrl.startsWith('https:') ? httpsAgent : httpAgent;
     
@@ -1319,18 +1457,31 @@ app.all('/go/:token', rateLimiter.middleware('proxy'), async (req, res) => {
       }
       
       // Special handling for video/audio streaming with Range support
+      // Safari/iOS requires specific headers for HLS and media playback
       const isMedia = contentType.includes('video') || contentType.includes('audio') || 
-                      targetUrl.match(/\.(mp4|webm|m4v|mov|mp3|m4a|aac|ogg|wav|m3u8|ts)(\?|$)/i);
+                      contentType.includes('mpegurl') || // HLS
+                      targetUrl.match(/\.(mp4|webm|m4v|mov|mp3|m4a|aac|ogg|wav|m3u8|ts|m4s)(\?|$)/i);
       
       if (isMedia) {
         // Forward Content-Range, Accept-Ranges, Content-Length for seeking
         const contentRange = upstreamResponse.headers.get('content-range');
-        const acceptRanges = upstreamResponse.headers.get('accept-ranges');
+        const acceptRanges = upstreamResponse.headers.get('accept-ranges') || 'bytes';
         const contentLength = upstreamResponse.headers.get('content-length');
         
+        // Safari/iOS specific headers for media playback
+        res.set('Accept-Ranges', acceptRanges);
         if (contentRange) res.set('Content-Range', contentRange);
-        if (acceptRanges) res.set('Accept-Ranges', acceptRanges);
         if (contentLength) res.set('Content-Length', contentLength);
+        
+        // CORS headers for Safari video playback
+        res.set('Access-Control-Allow-Origin', '*');
+        res.set('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+        res.set('Access-Control-Allow-Headers', 'Range');
+        res.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges');
+        res.set('Cross-Origin-Resource-Policy', 'cross-origin');
+        
+        // Prevent Safari caching issues
+        res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
         
         debug('STREAM', 'Streaming media content', {
           reqId,
@@ -1338,7 +1489,7 @@ app.all('/go/:token', rateLimiter.middleware('proxy'), async (req, res) => {
           contentType,
           contentLength: contentLength || 'unknown',
           contentRange: contentRange || 'none',
-          acceptRanges: acceptRanges || 'none',
+          acceptRanges: acceptRanges || 'bytes',
           status: upstreamResponse.status
         });
         
@@ -1471,6 +1622,11 @@ app.get('/go-ssr/:token', rateLimiter.middleware('proxy'), async (req, res) => {
     // Give JS a moment to execute initial scripts
     await page.waitForTimeout(1000);
     
+    // Get the FINAL URL after any redirects - critical for cross-domain SSO
+    const rawFinalUrl = page.url();
+    const finalUrl = normalizeWikimediaUrl(rawFinalUrl) || rawFinalUrl;
+    debug('HTML', 'Final URL after redirects (SSR)', { originalUrl: targetUrl?.substring(0, 80), rawFinalUrl: rawFinalUrl?.substring(0, 80), finalUrl: finalUrl?.substring(0, 80) });
+    
     const html = await page.content();
     
     await page.close();
@@ -1478,7 +1634,7 @@ app.get('/go-ssr/:token', rateLimiter.middleware('proxy'), async (req, res) => {
     returnContextToPool(context);
     context = null;
 
-    // Rewrite HTML using existing tokenizer
+    // Rewrite HTML using existing tokenizer - use finalUrl as base
     const gatewayBase = config.gatewayBase || `${req.protocol}://${req.get('host')}`;
     const tokenizeUrlSync = (url) => {
       try {
@@ -1489,7 +1645,7 @@ app.get('/go-ssr/:token', rateLimiter.middleware('proxy'), async (req, res) => {
       }
     };
 
-    const rewrittenHtml = rewriteHtml(html, targetUrl, tokenizeUrlSync, {
+    const rewrittenHtml = rewriteHtml(html, finalUrl, tokenizeUrlSync, {
         gatewayBase,
         sessionToken: resolution.sessionId || 'anonymous',
         pageToken: token
@@ -1863,16 +2019,56 @@ app.all('*', async (req, res) => {
   // For non-root paths that look like navigation (HTML accept header),
   // try to resolve against the Referer's original URL and redirect to tokenized version
   if (isNavigation) {
+    debug('REQUEST', 'Catch-all handling unmatched navigation path', {
+      path: req.path,
+      query: req.query,
+      referer: req.get('referer')?.substring(0, 100),
+      accept: req.get('accept')?.substring(0, 50)
+    });
+    
     try {
       const referer = req.get('referer') || '';
+      
+      // Try to extract token from referer
+      let refToken = null;
       const m = referer.match(/\/go\/([A-Za-z0-9_-]+)/);
       if (m) {
-        const refToken = m[1];
+        refToken = m[1];
+      }
+      
+      // Also check for token in cookie or custom header (set by bootstrap script)
+      if (!refToken) {
+        // Parse cookies manually from header (cookie-parser not configured)
+        let gatewayToken = req.get('x-gateway-token');
+        if (!gatewayToken && req.headers.cookie) {
+          const cookies = {};
+          req.headers.cookie.split(';').forEach(function(cookie) {
+            const parts = cookie.trim().split('=');
+            if (parts.length >= 2) {
+              cookies[parts[0].trim()] = parts.slice(1).join('=').trim();
+            }
+          });
+          gatewayToken = cookies.gatewayToken;
+        }
+        if (gatewayToken) {
+          refToken = gatewayToken;
+          debug('REQUEST', 'Got token from cookie/header', { tokenPreview: refToken?.substring(0, 12) + '...' });
+        }
+      }
+      
+      if (refToken) {
         const resolution = tokenStore.resolveToken(refToken, null);
         if (resolution.valid) {
           // Resolve the relative path against the original page URL
-          const upstreamUrl = resolveUrl(req.originalUrl || req.path, resolution.url);
-          console.log(`[Catch-all] Resolving navigation: ${req.path} -> ${upstreamUrl}`);
+          const fullPath = req.originalUrl || (req.path + (Object.keys(req.query).length ? '?' + new URLSearchParams(req.query).toString() : ''));
+          const upstreamUrl = resolveUrl(fullPath, resolution.url);
+          
+          debug('REQUEST', 'Catch-all resolving navigation', {
+            path: req.path,
+            fullPath,
+            baseUrl: resolution.url?.substring(0, 80),
+            resolved: upstreamUrl?.substring(0, 100)
+          });
           
           const validation = validateUrl(upstreamUrl, {
             allowedOrigin: config.allowedOrigin,
@@ -1884,33 +2080,40 @@ app.all('*', async (req, res) => {
             // Create a token for the resolved URL and redirect
             try {
               const { token: newToken } = tokenStore.createToken(upstreamUrl, resolution.sessionId || 'anonymous');
-              console.log(`[Catch-all] Redirecting to tokenized: /go/${newToken}`);
+              debug('REQUEST', 'Catch-all redirecting to tokenized URL', { 
+                tokenPreview: newToken?.substring(0, 12) + '...',
+                url: upstreamUrl?.substring(0, 80)
+              });
               return res.redirect(302, `/go/${newToken}`);
             } catch (e) {
-              console.warn('[Catch-all] Token creation failed:', e.message);
+              debugError('REQUEST', 'Catch-all token creation failed', e);
             }
+          } else {
+            debugWarn('REQUEST', 'Catch-all URL validation failed', { reason: validation.reason });
           }
+        } else {
+          debugWarn('REQUEST', 'Catch-all referer token invalid', { reason: resolution.reason });
         }
+      } else {
+        debug('REQUEST', 'Catch-all no token found in referer', { referer: referer?.substring(0, 100) });
       }
     } catch (e) {
-      console.warn('[Catch-all] Navigation resolution failed:', e.message);
+      debugError('REQUEST', 'Catch-all navigation resolution failed', e);
     }
     
-    return res.status(404).type('text/html').send(`
-      <!DOCTYPE html>
-      <html>
-      <head><title>404 - Not Found</title></head>
-      <body style="font-family: sans-serif; padding: 2rem; background: #0f172a; color: #e2e8f0;">
-        <h1>404 - Page Not Found</h1>
-        <p>The requested path <code>${req.path}</code> was not found.</p>
-        <p>If you're trying to browse a site, please use the <a href="/" style="color: #6366f1;">Gateway Browser</a>.</p>
-      </body>
-      </html>
-    `);
+    return res.status(404).json({
+      error: 'Not found',
+      path: req.path,
+      hint: 'This path was not tokenized. The navigation may have bypassed the gateway. Try navigating from the main gateway page.',
+      details: 'Links should go through /go/<token> format. If you clicked a link and got here, the click interception may have failed.'
+    });
   }
   
   // For all other unmatched paths, return appropriate error
-  res.status(404).type('text/plain').send('Not found');
+  res.status(404).json({ 
+    error: 'Not found',
+    hint: 'This path was not tokenized. Use /go/<token> format.'
+  });
 });
 
 // ============================================================================
