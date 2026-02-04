@@ -1,0 +1,1183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Webtra — Secure Browser Proxy</title>
+    <style>
+        :root {
+            --bg1: #020c1f;
+            --bg2: #0b3c91;
+            --blue: #2aa9ff;
+            --blue2: #7fd0ff;
+            --text: #eaf4ff;
+            --muted: #b9d9ff;
+            --glass: rgba(255,255,255,0.08);
+            --glass2: rgba(0,0,0,0.35);
+            --border: rgba(42,169,255,0.35);
+            --shadow: rgba(0,0,0,0.55);
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+
+        body {
+            min-height: 100vh;
+            color: var(--text);
+            overflow-x: hidden;
+            background:
+                radial-gradient(1000px 600px at 20% 10%, rgba(42,169,255,0.22), transparent 60%),
+                radial-gradient(900px 700px at 85% 30%, rgba(127,208,255,0.14), transparent 65%),
+                radial-gradient(circle at top, var(--bg2), var(--bg1));
+        }
+
+        .grid {
+            position: fixed; inset: -40%;
+            background-image:
+                linear-gradient(rgba(42,169,255,0.10) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(42,169,255,0.08) 1px, transparent 1px);
+            background-size: 48px 48px;
+            transform: rotate(12deg);
+            animation: drift 18s linear infinite;
+            filter: blur(0.2px);
+            opacity: 0.55;
+            pointer-events: none;
+            z-index: 0;
+        }
+        @keyframes drift {
+            0% { transform: translate3d(0,0,0) rotate(12deg); }
+            100% { transform: translate3d(140px, -120px, 0) rotate(12deg); }
+        }
+
+        .glow {
+            position: fixed;
+            width: 750px; height: 750px;
+            background: rgba(42,169,255,0.20);
+            filter: blur(160px);
+            border-radius: 999px;
+            animation: float 9s ease-in-out infinite;
+            pointer-events: none;
+            z-index: 0;
+        }
+        .glow.g2 {
+            width: 620px; height: 620px;
+            background: rgba(127,208,255,0.14);
+            animation-duration: 11s;
+            animation-delay: -2s;
+            left: 55%; top: 10%;
+        }
+        @keyframes float {
+            0% { transform: translateY(0) translateX(0); }
+            50% { transform: translateY(-55px) translateX(25px); }
+            100% { transform: translateY(0) translateX(0); }
+        }
+
+        .streaks {
+            position: fixed; inset: 0;
+            pointer-events: none;
+            background:
+                repeating-linear-gradient(
+                    115deg,
+                    rgba(42,169,255,0.00) 0px,
+                    rgba(42,169,255,0.00) 140px,
+                    rgba(42,169,255,0.06) 160px,
+                    rgba(42,169,255,0.00) 190px
+                );
+            animation: streakmove 7s linear infinite;
+            opacity: 0.6;
+            z-index: 0;
+        }
+        @keyframes streakmove {
+            0% { background-position: 0 0; }
+            100% { background-position: 420px 0; }
+        }
+
+        /* Veltra Modal */
+        .veltra-modal {
+            position: fixed;
+            inset: 0;
+            background: rgba(2, 12, 31, 0.95);
+            backdrop-filter: blur(20px);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+            animation: fadeIn 0.5s ease;
+        }
+        .veltra-modal.hidden { display: none; }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+
+        .veltra-content {
+            text-align: center;
+            max-width: 600px;
+            padding: 48px;
+            background: var(--glass);
+            backdrop-filter: blur(18px);
+            border: 1px solid rgba(255,255,255,0.10);
+            border-radius: 22px;
+            box-shadow: 0 40px 90px var(--shadow);
+            animation: pop 600ms ease;
+        }
+        @keyframes pop {
+            from { opacity: 0; transform: translateY(18px) scale(0.98); }
+            to { opacity: 1; transform: translateY(0) scale(1); }
+        }
+
+        .veltra-content h2 {
+            font-size: 2rem;
+            font-weight: 900;
+            background: linear-gradient(90deg, #dff3ff, #9ad9ff, #2aa9ff);
+            -webkit-background-clip: text;
+            background-clip: text;
+            color: transparent;
+            margin-bottom: 16px;
+        }
+
+        .veltra-content p {
+            color: var(--muted);
+            font-size: 1.05rem;
+            line-height: 1.6;
+            margin-bottom: 24px;
+        }
+
+        .veltra-content .highlight {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 12px 20px;
+            background: rgba(42,169,255,0.18);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            color: var(--blue2);
+            font-weight: 600;
+            margin-bottom: 24px;
+        }
+
+        .veltra-btns {
+            display: flex;
+            gap: 12px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+
+        .veltra-btn {
+            padding: 14px 28px;
+            border-radius: 12px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            text-decoration: none;
+        }
+
+        .veltra-btn.primary {
+            background: linear-gradient(135deg, var(--blue), var(--blue2));
+            border: none;
+            color: #020c1f;
+        }
+        .veltra-btn.primary:hover { transform: translateY(-2px); box-shadow: 0 8px 30px rgba(42,169,255,0.4); }
+
+        .veltra-btn.secondary {
+            background: var(--glass2);
+            border: 1px solid rgba(255,255,255,0.15);
+            color: var(--text);
+        }
+        .veltra-btn.secondary:hover { background: rgba(255,255,255,0.12); }
+
+        /* Landing Page */
+        .landing {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            padding: 40px 20px;
+            position: relative;
+            z-index: 2;
+        }
+
+        .title {
+            font-size: 3.4rem;
+            font-weight: 900;
+            letter-spacing: 0.8px;
+            background: linear-gradient(90deg, #dff3ff, #9ad9ff, #2aa9ff);
+            -webkit-background-clip: text;
+            background-clip: text;
+            color: transparent;
+            text-shadow: 0 0 22px rgba(42,169,255,0.18);
+        }
+
+        .tagline {
+            margin-top: 10px;
+            color: var(--muted);
+            font-size: 1.1rem;
+        }
+
+        .badge {
+            display: inline-flex;
+            gap: 10px;
+            align-items: center;
+            margin: 22px auto 10px;
+            padding: 10px 16px;
+            border-radius: 999px;
+            background: rgba(42,169,255,0.18);
+            border: 1px solid var(--border);
+            color: #d8f0ff;
+            font-size: 0.92rem;
+        }
+
+        .dot {
+            width: 10px; height: 10px;
+            border-radius: 999px;
+            background: var(--blue);
+            box-shadow: 0 0 18px rgba(42,169,255,0.8);
+            animation: pulse 1.25s ease-in-out infinite;
+        }
+        @keyframes pulse {
+            0%,100% { transform: scale(1); opacity: 0.9; }
+            50% { transform: scale(1.35); opacity: 1; }
+        }
+
+        .search-container {
+            width: 100%;
+            max-width: 600px;
+            margin: 30px 0 20px;
+        }
+
+        .search-box {
+            display: flex;
+            background: var(--glass2);
+            border: 1px solid rgba(255,255,255,0.10);
+            border-radius: 14px;
+            overflow: hidden;
+            box-shadow: 0 8px 32px var(--shadow);
+        }
+
+        .search-box input {
+            flex: 1;
+            background: transparent;
+            border: none;
+            padding: 18px 24px;
+            font-size: 1.05rem;
+            color: var(--text);
+            outline: none;
+        }
+        .search-box input::placeholder { color: #6a9fd4; }
+
+        .search-box button {
+            background: linear-gradient(135deg, var(--blue), var(--blue2));
+            border: none;
+            padding: 18px 32px;
+            color: #020c1f;
+            font-weight: 700;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .search-box button:hover { filter: brightness(1.1); }
+        .search-box button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        .quick-sites {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            justify-content: center;
+            max-width: 700px;
+        }
+
+        .site-btn {
+            background: var(--glass);
+            border: 1px solid rgba(255,255,255,0.08);
+            padding: 10px 18px;
+            border-radius: 999px;
+            color: var(--text);
+            cursor: pointer;
+            transition: all 0.2s;
+            font-size: 0.95rem;
+        }
+        .site-btn:hover {
+            background: rgba(42,169,255,0.2);
+            border-color: var(--blue);
+            transform: translateY(-2px);
+        }
+
+        .info {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 16px;
+            max-width: 800px;
+            margin-top: 40px;
+        }
+
+        .info-card {
+            background: var(--glass2);
+            border: 1px solid rgba(255,255,255,0.08);
+            padding: 20px;
+            border-radius: 14px;
+            text-align: center;
+            box-shadow: inset 0 0 0 1px rgba(42,169,255,0.08);
+        }
+
+        .info-card .icon { font-size: 2rem; margin-bottom: 10px; }
+        .info-card h3 { font-size: 0.95rem; color: var(--blue2); margin-bottom: 6px; font-weight: 700; }
+        .info-card p { font-size: 0.82rem; color: #9fc5ff; opacity: 0.9; }
+
+        .status {
+            margin-top: 20px;
+            padding: 12px 24px;
+            background: rgba(42,169,255,0.15);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            color: var(--blue2);
+            display: none;
+        }
+        .status.error {
+            background: rgba(255,80,80,0.15);
+            border-color: rgba(255,80,80,0.4);
+            color: #ff9090;
+        }
+        .status.show { display: block; }
+
+        footer {
+            margin-top: 30px;
+            color: #7ab8e8;
+            font-size: 0.85rem;
+            opacity: 0.8;
+        }
+        footer a { color: var(--blue2); text-decoration: none; }
+        footer a:hover { text-decoration: underline; }
+
+        /* Browser View */
+        .browser-view {
+            display: none;
+            flex-direction: column;
+            height: 100vh;
+            width: 100%;
+            position: relative;
+            z-index: 10;
+        }
+        .browser-view.active { display: flex; }
+
+        .browser-toolbar {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px 14px;
+            background: rgba(2, 12, 31, 0.95);
+            border-bottom: 1px solid rgba(42,169,255,0.2);
+            backdrop-filter: blur(10px);
+        }
+
+        .nav-btn {
+            background: var(--glass2);
+            border: 1px solid rgba(255,255,255,0.1);
+            width: 38px; height: 38px;
+            border-radius: 10px;
+            color: var(--text);
+            cursor: pointer;
+            font-size: 1.1rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+        }
+        .nav-btn:hover { background: rgba(42,169,255,0.2); border-color: var(--blue); }
+
+        .url-bar {
+            flex: 1;
+            display: flex;
+            background: var(--glass2);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 10px;
+            overflow: hidden;
+        }
+
+        .url-bar input {
+            flex: 1;
+            background: transparent;
+            border: none;
+            padding: 10px 15px;
+            color: var(--text);
+            font-size: 0.9rem;
+            outline: none;
+        }
+
+        .url-bar button {
+            background: linear-gradient(135deg, var(--blue), var(--blue2));
+            border: none;
+            padding: 10px 20px;
+            color: #020c1f;
+            font-weight: 600;
+            cursor: pointer;
+        }
+
+        .close-btn {
+            background: rgba(255,80,80,0.3) !important;
+            border-color: rgba(255,80,80,0.5) !important;
+        }
+        .close-btn:hover { background: rgba(255,80,80,0.5) !important; }
+
+        .browser-content {
+            flex: 1;
+            position: relative;
+            overflow: hidden;
+            background: #020c1f;
+        }
+
+        #browserCanvas {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            cursor: default;
+        }
+
+        .loading-overlay {
+            position: absolute;
+            inset: 0;
+            background: rgba(2, 12, 31, 0.9);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-direction: column;
+            z-index: 10;
+        }
+        .loading-overlay.hidden { display: none; }
+
+        .spinner {
+            width: 50px; height: 50px;
+            border: 3px solid rgba(42,169,255,0.2);
+            border-top-color: var(--blue);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        .loading-text {
+            margin-top: 15px;
+            color: var(--muted);
+        }
+
+        .stats {
+            position: absolute;
+            bottom: 10px; right: 10px;
+            background: rgba(2, 12, 31, 0.8);
+            padding: 6px 12px;
+            border-radius: 8px;
+            font-size: 0.75rem;
+            color: #7ab8e8;
+            border: 1px solid rgba(42,169,255,0.2);
+        }
+
+        @media (max-width: 600px) {
+            .title { font-size: 2.5rem; }
+            .veltra-content { padding: 32px 20px; }
+            .veltra-content h2 { font-size: 1.5rem; }
+        }
+    </style>
+</head>
+<body>
+    <div class="grid"></div>
+    <div class="glow" style="left:-10%; top:30%;"></div>
+    <div class="glow g2"></div>
+    <div class="streaks"></div>
+
+    <!-- Veltra Modal -->
+    <div class="veltra-modal" id="veltraModal">
+        <div class="veltra-content">
+            <h2>🌐 Welcome to Webtra</h2>
+            <p>
+                Webtra is also available as part of <strong>Veltra OS</strong> — a complete web-based operating system with built-in apps, file management, and more!
+            </p>
+            <div class="highlight">
+                ✨ Full Desktop Experience at veltra
+            </div>
+            <p style="font-size: 0.95rem; opacity: 0.85;">
+                You can use Webtra standalone here, or get the complete experience with Veltra OS.
+            </p>
+            <div class="veltra-btns">
+                <a href="https://mojhehh.github.io/veltra/" class="veltra-btn primary" target="_blank">
+                    🚀 Open Veltra OS
+                </a>
+                <button class="veltra-btn secondary" id="continueBtn">
+                    Continue to Webtra →
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Landing Page -->
+    <div class="landing" id="landingPage">
+        <div class="title">Webtra</div>
+        <p class="tagline">Secure browser proxy — works with everything</p>
+
+        <div class="badge">
+            <span class="dot"></span>
+            End-to-End Encrypted • Real Chromium Browser
+        </div>
+
+        <div class="search-container">
+            <form class="search-box" id="startForm">
+                <input type="text" id="urlInput" placeholder="Enter any URL (tiktok.com, roblox.com, etc.)" required>
+                <button type="submit" id="startBtn">Launch →</button>
+            </form>
+        </div>
+
+        <div class="quick-sites">
+            <button class="site-btn" data-url="https://www.tiktok.com">🎵 TikTok</button>
+            <button class="site-btn" data-url="https://www.youtube.com">▶️ YouTube</button>
+            <button class="site-btn" data-url="https://www.roblox.com">🎮 Roblox</button>
+            <button class="site-btn" data-url="https://now.gg">☁️ Now.gg</button>
+            <button class="site-btn" data-url="https://www.twitch.tv">📺 Twitch</button>
+            <button class="site-btn" data-url="https://discord.com/app">💬 Discord</button>
+            <button class="site-btn" data-url="https://www.reddit.com">🤖 Reddit</button>
+            <button class="site-btn" data-url="https://www.google.com">🔍 Google</button>
+        </div>
+
+        <div class="status" id="status"></div>
+
+        <div class="info">
+            <div class="info-card">
+                <div class="icon">🖥️</div>
+                <h3>Real Browser</h3>
+                <p>Full Chromium running on server</p>
+            </div>
+            <div class="info-card">
+                <div class="icon">✅</div>
+                <h3>95%+ Compatible</h3>
+                <p>TikTok, Roblox, Now.gg — all work</p>
+            </div>
+            <div class="info-card">
+                <div class="icon">🔒</div>
+                <h3>Secure</h3>
+                <p>Your IP hidden from sites</p>
+            </div>
+            <div class="info-card">
+                <div class="icon">⚡</div>
+                <h3>Low Latency</h3>
+                <p>Optimized 60 FPS streaming</p>
+            </div>
+        </div>
+
+        <footer>
+            © 2026 Webtra • Also available on <a href="https://mojhehh.github.io/veltra/" target="_blank">Veltra OS</a>
+        </footer>
+    </div>
+
+    <!-- Browser View -->
+    <div class="browser-view" id="browserView">
+        <div class="browser-toolbar">
+            <button class="nav-btn" id="backBtn" title="Back">←</button>
+            <button class="nav-btn" id="forwardBtn" title="Forward">→</button>
+            <button class="nav-btn" id="refreshBtn" title="Refresh">⟳</button>
+
+            <div class="url-bar">
+                <input type="text" id="currentUrl" placeholder="URL">
+                <button id="goBtn">Go</button>
+            </div>
+
+            <button class="nav-btn" id="fullscreenBtn" title="Fullscreen">⛶</button>
+            <button class="nav-btn close-btn" id="closeBtn" title="Close">✕</button>
+        </div>
+
+        <div class="browser-content">
+            <div class="loading-overlay" id="loadingOverlay">
+                <div class="spinner"></div>
+                <div class="loading-text">Connecting to browser...</div>
+            </div>
+
+            <canvas id="browserCanvas"></canvas>
+
+            <div class="stats" id="stats">FPS: -- | Latency: --ms</div>
+        </div>
+    </div>
+
+    <script>
+        // ============ FIREBASE BACKEND DETECTION ============
+        const FIREBASE_URL = 'https://procces-3efd9-default-rtdb.firebaseio.com/backends/bestproxy.json';
+        let backendUrl = null;
+        
+        // Check if we're running on GitHub Pages or other deployment (not localhost)
+        const isDeployed = !location.hostname.includes('localhost') && !location.hostname.includes('127.0.0.1');
+        
+        // Fetch backend URL from Firebase if deployed
+        async function getBackendUrl() {
+            if (!isDeployed) {
+                return location.origin;
+            }
+            
+            try {
+                const response = await fetch(FIREBASE_URL);
+                const data = await response.json();
+                if (data?.url) {
+                    console.log('🔥 Using Firebase backend:', data.url);
+                    return data.url;
+                }
+            } catch (err) {
+                console.error('Failed to fetch backend URL:', err);
+            }
+            
+            const url = prompt('Enter Best Proxy backend URL:');
+            return url || location.origin;
+        }
+        
+        // Initialize backend URL on page load
+        (async () => {
+            backendUrl = await getBackendUrl();
+            console.log('Backend URL:', backendUrl);
+        })();
+        
+        // ============ END FIREBASE BACKEND DETECTION ============
+
+        // Veltra modal
+        document.getElementById('continueBtn').addEventListener('click', () => {
+            document.getElementById('veltraModal').classList.add('hidden');
+        });
+
+        // State
+        let ws = null;
+        let sessionId = null;
+        let canvas, ctx;
+        let frameCount = 0;
+        let lastFpsUpdate = Date.now();
+        let fps = 0;
+        let latency = 0;
+
+        // Elements
+        const landingPage = document.getElementById('landingPage');
+        const browserView = document.getElementById('browserView');
+        const urlInput = document.getElementById('urlInput');
+        const currentUrlInput = document.getElementById('currentUrl');
+        const startBtn = document.getElementById('startBtn');
+        const status = document.getElementById('status');
+        const loadingOverlay = document.getElementById('loadingOverlay');
+        const statsEl = document.getElementById('stats');
+
+        // Initialize canvas
+        function initCanvas() {
+            canvas = document.getElementById('browserCanvas');
+            ctx = canvas.getContext('2d');
+            canvas.width = 1280;
+            canvas.height = 720;
+        }
+
+        // Show status message
+        function showStatus(msg, isError = false) {
+            status.textContent = msg;
+            status.className = 'status show' + (isError ? ' error' : '');
+        }
+
+        // Normalize URL
+        function normalizeUrl(url) {
+            url = url.trim();
+            if (!url.match(/^https?:\/\//)) {
+                url = 'https://' + url;
+            }
+            return url;
+        }
+        
+        // Start browser session
+        async function startSession(url) {
+            url = normalizeUrl(url);
+            startBtn.disabled = true;
+            showStatus('Starting browser...');
+            
+            // Ensure we have backend URL
+            if (!backendUrl) {
+                backendUrl = await getBackendUrl();
+            }
+            
+            try {
+                const res = await fetch(backendUrl + '/api/session', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url })
+                });
+                
+                const data = await res.json();
+                
+                if (data.error) {
+                    showStatus(data.error, true);
+                    startBtn.disabled = false;
+                    return;
+                }
+                
+                sessionId = data.sessionId;
+                showStatus('Connecting to stream...');
+                
+                // Connect WebSocket
+                connectWebSocket();
+                
+            } catch (err) {
+                showStatus('Failed to start: ' + err.message, true);
+                startBtn.disabled = false;
+            }
+        }
+        
+        // Connect to WebSocket stream
+        function connectWebSocket() {
+            // Build WebSocket URL from backend URL
+            const wsUrl = backendUrl.replace(/^http/, 'ws') + '/stream?session=' + sessionId;
+            ws = new WebSocket(wsUrl);
+            
+            ws.onopen = () => {
+                console.log('WebSocket connected');
+                showBrowser();
+            };
+            
+            ws.onmessage = (e) => {
+                const data = JSON.parse(e.data);
+                
+                if (data.type === 'frame') {
+                    renderFrame(data.data);
+                    latency = Date.now() - data.timestamp;
+                } else if (data.type === 'url') {
+                    currentUrlInput.value = data.url;
+                } else if (data.type === 'error') {
+                    alert('Error: ' + data.message);
+                } else if (data.type === 'fullscreen_request') {
+                    toggleFullscreen();
+                }
+            };
+            
+            ws.onclose = () => {
+                console.log('WebSocket closed');
+                if (browserView.classList.contains('active')) {
+                    alert('Connection lost. Returning to home.');
+                    closeBrowser();
+                }
+            };
+            
+            ws.onerror = (err) => {
+                console.error('WebSocket error:', err);
+                showStatus('Connection error', true);
+            };
+        }
+        
+        // Show browser view
+        function showBrowser() {
+            landingPage.style.display = 'none';
+            browserView.classList.add('active');
+            loadingOverlay.classList.remove('hidden');
+            initCanvas();
+            setupInputHandlers();
+            startBtn.disabled = false;
+            status.classList.remove('show');
+            
+            setTimeout(() => {
+                loadingOverlay.classList.add('hidden');
+            }, 2000);
+        }
+        
+        // Close browser and return to landing
+        function closeBrowser() {
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+            
+            if (sessionId && backendUrl) {
+                fetch(backendUrl + '/api/session/' + sessionId, { method: 'DELETE' }).catch(() => {});
+                sessionId = null;
+            }
+            
+            browserView.classList.remove('active');
+            landingPage.style.display = 'flex';
+        }
+        
+        // Render a frame
+        function renderFrame(base64Data) {
+            const img = new Image();
+            img.onload = () => {
+                if (canvas.width !== img.width || canvas.height !== img.height) {
+                    canvas.width = img.width;
+                    canvas.height = img.height;
+                }
+                ctx.drawImage(img, 0, 0);
+                
+                frameCount++;
+                const now = Date.now();
+                if (now - lastFpsUpdate >= 1000) {
+                    fps = frameCount;
+                    frameCount = 0;
+                    lastFpsUpdate = now;
+                    statsEl.textContent = 'FPS: ' + fps + ' | Latency: ' + latency + 'ms';
+                }
+                
+                loadingOverlay.classList.add('hidden');
+            };
+            img.src = 'data:image/jpeg;base64,' + base64Data;
+        }
+        
+        // Setup mouse/keyboard handlers
+        function setupInputHandlers() {
+            let lastMouseMove = 0;
+            const mouseMoveThrottle = 16;
+            
+            function getCoords(e) {
+                const rect = canvas.getBoundingClientRect();
+                
+                let clientX, clientY;
+                if (e.touches && e.touches.length > 0) {
+                    clientX = e.touches[0].clientX;
+                    clientY = e.touches[0].clientY;
+                } else if (e.changedTouches && e.changedTouches.length > 0) {
+                    clientX = e.changedTouches[0].clientX;
+                    clientY = e.changedTouches[0].clientY;
+                } else {
+                    clientX = e.clientX;
+                    clientY = e.clientY;
+                }
+                
+                const canvasAspect = canvas.width / canvas.height;
+                const rectAspect = rect.width / rect.height;
+                
+                let renderWidth, renderHeight, offsetX, offsetY;
+                
+                if (rectAspect > canvasAspect) {
+                    renderHeight = rect.height;
+                    renderWidth = rect.height * canvasAspect;
+                    offsetX = (rect.width - renderWidth) / 2;
+                    offsetY = 0;
+                } else {
+                    renderWidth = rect.width;
+                    renderHeight = rect.width / canvasAspect;
+                    offsetX = 0;
+                    offsetY = (rect.height - renderHeight) / 2;
+                }
+                
+                const relX = clientX - rect.left - offsetX;
+                const relY = clientY - rect.top - offsetY;
+                
+                const x = Math.round((relX / renderWidth) * canvas.width);
+                const y = Math.round((relY / renderHeight) * canvas.height);
+                
+                return { 
+                    x: Math.max(0, Math.min(canvas.width, x)), 
+                    y: Math.max(0, Math.min(canvas.height, y)) 
+                };
+            }
+            
+            // Hidden input for mobile keyboard
+            const hiddenInput = document.createElement('input');
+            hiddenInput.type = 'text';
+            hiddenInput.autocomplete = 'off';
+            hiddenInput.autocapitalize = 'off';
+            hiddenInput.autocorrect = 'off';
+            hiddenInput.spellcheck = false;
+            hiddenInput.style.cssText = 'position:fixed;left:0;bottom:0;width:1px;height:1px;opacity:0;pointer-events:none;z-index:-1;font-size:16px;';
+            document.body.appendChild(hiddenInput);
+            
+            let keyboardActive = false;
+            let longPressTimer = null;
+            
+            hiddenInput.addEventListener('input', (e) => {
+                const text = e.data;
+                if (text) {
+                    for (const char of text) {
+                        sendInput({ type: 'keyboard', event: 'keypress', key: char, text: char });
+                    }
+                }
+                hiddenInput.value = '';
+            });
+            
+            hiddenInput.addEventListener('keydown', (e) => {
+                if (['Backspace', 'Enter', 'Tab', 'Escape', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)) {
+                    e.preventDefault();
+                    sendInput({ type: 'keyboard', event: 'keydown', key: e.key, code: e.code });
+                    sendInput({ type: 'keyboard', event: 'keyup', key: e.key, code: e.code });
+                }
+            });
+            
+            function showKeyboard() {
+                keyboardActive = true;
+                hiddenInput.style.pointerEvents = 'auto';
+                hiddenInput.focus();
+            }
+            
+            function hideKeyboard() {
+                keyboardActive = false;
+                hiddenInput.blur();
+                hiddenInput.style.pointerEvents = 'none';
+            }
+            
+            // Mouse events
+            let mouseIsDown = false;
+            let lastDragPos = null;
+            
+            canvas.addEventListener('mousemove', (e) => {
+                const now = Date.now();
+                const { x, y } = getCoords(e);
+                
+                if (mouseIsDown) {
+                    sendInput({ type: 'mouse', event: 'mousemove', x, y });
+                    lastDragPos = { x, y };
+                } else {
+                    if (now - lastMouseMove < mouseMoveThrottle) return;
+                    lastMouseMove = now;
+                    sendInput({ type: 'mouse', event: 'mousemove', x, y });
+                }
+            });
+            
+            canvas.addEventListener('mousedown', (e) => {
+                e.preventDefault();
+                mouseIsDown = true;
+                const { x, y } = getCoords(e);
+                lastDragPos = { x, y };
+                const button = ['left', 'middle', 'right'][e.button] || 'left';
+                sendInput({ type: 'mouse', event: 'mousedown', x, y, button });
+            });
+            
+            canvas.addEventListener('mouseup', (e) => {
+                e.preventDefault();
+                const { x, y } = getCoords(e);
+                const button = ['left', 'middle', 'right'][e.button] || 'left';
+                sendInput({ type: 'mouse', event: 'mouseup', x, y, button });
+                mouseIsDown = false;
+                lastDragPos = null;
+            });
+            
+            canvas.addEventListener('mouseleave', (e) => {
+                if (mouseIsDown) {
+                    const { x, y } = getCoords(e);
+                    sendInput({ type: 'mouse', event: 'mouseup', x, y, button: 'left' });
+                    mouseIsDown = false;
+                    lastDragPos = null;
+                }
+            });
+            
+            canvas.addEventListener('dblclick', (e) => {
+                e.preventDefault();
+                const { x, y } = getCoords(e);
+                sendInput({ type: 'mouse', event: 'dblclick', x, y });
+            });
+            
+            canvas.addEventListener('wheel', (e) => {
+                e.preventDefault();
+                sendInput({ type: 'mouse', event: 'wheel', deltaX: e.deltaX, deltaY: e.deltaY });
+            }, { passive: false });
+            
+            // Touch events
+            let touchStartTime = 0;
+            let touchStartPos = null;
+            let touchCount = 0;
+            let lastTap = 0;
+            let lastTapPos = null;
+            let isDragging = false;
+            let touchActive = false;
+            
+            canvas.addEventListener('touchstart', (e) => {
+                e.preventDefault();
+                touchCount = e.touches.length;
+                touchStartTime = Date.now();
+                
+                if (longPressTimer) clearTimeout(longPressTimer);
+                
+                if (touchCount === 1) {
+                    const { x, y } = getCoords(e);
+                    touchStartPos = { x, y };
+                    isDragging = false;
+                    touchActive = true;
+                    
+                    sendInput({ type: 'touch', event: 'touchstart', x, y });
+                    
+                    longPressTimer = setTimeout(() => {
+                        showKeyboard();
+                    }, 500);
+                    
+                } else if (touchCount === 2) {
+                    touchActive = false;
+                }
+            }, { passive: false });
+            
+            canvas.addEventListener('touchmove', (e) => {
+                e.preventDefault();
+                
+                if (e.touches.length === 1 && touchStartPos && touchActive) {
+                    const { x, y } = getCoords(e);
+                    const dx = Math.abs(x - touchStartPos.x);
+                    const dy = Math.abs(y - touchStartPos.y);
+                    
+                    if (dx > 10 || dy > 10) {
+                        isDragging = true;
+                        if (longPressTimer) {
+                            clearTimeout(longPressTimer);
+                            longPressTimer = null;
+                        }
+                    }
+                    
+                    if (isDragging) {
+                        sendInput({ type: 'touch', event: 'touchmove', x, y });
+                    }
+                    
+                } else if (e.touches.length === 2) {
+                    const avgY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+                    const rect = canvas.getBoundingClientRect();
+                    const deltaY = (e.touches[0].clientY - rect.top) - avgY;
+                    sendInput({ type: 'mouse', event: 'wheel', deltaX: 0, deltaY: deltaY * 2 });
+                }
+            }, { passive: false });
+            
+            canvas.addEventListener('touchend', (e) => {
+                e.preventDefault();
+                
+                if (longPressTimer) {
+                    clearTimeout(longPressTimer);
+                    longPressTimer = null;
+                }
+                
+                const touchDuration = Date.now() - touchStartTime;
+                
+                if (touchCount === 1 && touchStartPos) {
+                    const { x, y } = getCoords(e);
+                    
+                    if (isDragging) {
+                        sendInput({ type: 'touch', event: 'touchend', x, y });
+                    } else if (touchDuration < 300) {
+                        sendInput({ type: 'touch', event: 'touchend', x: touchStartPos.x, y: touchStartPos.y });
+                        
+                        const now = Date.now();
+                        if (lastTap && now - lastTap < 300 && lastTapPos) {
+                            const tapDx = Math.abs(touchStartPos.x - lastTapPos.x);
+                            const tapDy = Math.abs(touchStartPos.y - lastTapPos.y);
+                            if (tapDx < 50 && tapDy < 50) {
+                                sendInput({ type: 'mouse', event: 'dblclick', x: touchStartPos.x, y: touchStartPos.y });
+                                lastTap = 0;
+                                lastTapPos = null;
+                            } else {
+                                sendInput({ type: 'touch', event: 'tap', x: touchStartPos.x, y: touchStartPos.y });
+                                lastTap = now;
+                                lastTapPos = { x: touchStartPos.x, y: touchStartPos.y };
+                            }
+                        } else {
+                            sendInput({ type: 'touch', event: 'tap', x: touchStartPos.x, y: touchStartPos.y });
+                            lastTap = now;
+                            lastTapPos = { x: touchStartPos.x, y: touchStartPos.y };
+                        }
+                    } else {
+                        sendInput({ type: 'touch', event: 'touchend', x: touchStartPos.x, y: touchStartPos.y });
+                    }
+                }
+                
+                touchStartPos = null;
+                touchCount = 0;
+                isDragging = false;
+                touchActive = false;
+            }, { passive: false });
+            
+            canvas.addEventListener('touchcancel', () => {
+                if (longPressTimer) {
+                    clearTimeout(longPressTimer);
+                    longPressTimer = null;
+                }
+                if (touchStartPos) {
+                    sendInput({ type: 'touch', event: 'touchend', x: touchStartPos.x, y: touchStartPos.y });
+                }
+                touchStartPos = null;
+                touchCount = 0;
+                isDragging = false;
+                touchActive = false;
+            }, { passive: true });
+            
+            // Keyboard events
+            document.addEventListener('keydown', (e) => {
+                if (!browserView.classList.contains('active')) return;
+                if (document.activeElement === currentUrlInput) return;
+                if (document.activeElement === hiddenInput) return;
+                
+                e.preventDefault();
+                sendInput({ type: 'keyboard', event: 'keydown', key: e.key, code: e.code });
+            });
+            
+            document.addEventListener('keyup', (e) => {
+                if (!browserView.classList.contains('active')) return;
+                if (document.activeElement === currentUrlInput) return;
+                if (document.activeElement === hiddenInput) return;
+                
+                e.preventDefault();
+                sendInput({ type: 'keyboard', event: 'keyup', key: e.key, code: e.code });
+            });
+            
+            canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+            
+            document.addEventListener('click', (e) => {
+                if (e.target !== canvas && e.target !== hiddenInput && keyboardActive) {
+                    hideKeyboard();
+                }
+            });
+        }
+        
+        // Send input to server
+        function sendInput(input) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify(input));
+            }
+        }
+        
+        // Navigation handlers
+        document.getElementById('backBtn').addEventListener('click', () => {
+            sendInput({ type: 'action', action: 'back' });
+        });
+        
+        document.getElementById('forwardBtn').addEventListener('click', () => {
+            sendInput({ type: 'action', action: 'forward' });
+        });
+        
+        document.getElementById('refreshBtn').addEventListener('click', () => {
+            sendInput({ type: 'action', action: 'refresh' });
+        });
+        
+        document.getElementById('goBtn').addEventListener('click', () => {
+            const url = normalizeUrl(currentUrlInput.value);
+            sendInput({ type: 'navigate', url });
+        });
+        
+        currentUrlInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                const url = normalizeUrl(currentUrlInput.value);
+                sendInput({ type: 'navigate', url });
+            }
+        });
+        
+        document.getElementById('closeBtn').addEventListener('click', closeBrowser);
+        
+        // Fullscreen toggle
+        function toggleFullscreen() {
+            const elem = document.getElementById('browserView');
+            if (!document.fullscreenElement && !document.webkitFullscreenElement) {
+                if (elem.requestFullscreen) {
+                    elem.requestFullscreen();
+                } else if (elem.webkitRequestFullscreen) {
+                    elem.webkitRequestFullscreen();
+                }
+            } else {
+                if (document.exitFullscreen) {
+                    document.exitFullscreen();
+                } else if (document.webkitExitFullscreen) {
+                    document.webkitExitFullscreen();
+                }
+            }
+        }
+        
+        document.getElementById('fullscreenBtn').addEventListener('click', toggleFullscreen);
+        
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && document.fullscreenElement) {
+                document.exitFullscreen();
+            }
+        });
+        
+        // Start form
+        document.getElementById('startForm').addEventListener('submit', (e) => {
+            e.preventDefault();
+            startSession(urlInput.value);
+        });
+        
+        // Quick site buttons
+        document.querySelectorAll('.site-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const url = btn.dataset.url;
+                urlInput.value = url;
+                startSession(url);
+            });
+        });
+    </script>
+</body>
+</html>
