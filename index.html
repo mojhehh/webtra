@@ -722,10 +722,27 @@
                 showBrowser();
             };
             
-            ws.onmessage = (e) => {
+            ws.onmessage = async (e) => {
+                // Binary frame (raw JPEG with 8-byte timestamp prefix)
+                if (e.data instanceof Blob) {
+                    const buffer = await e.data.arrayBuffer();
+                    const view = new DataView(buffer);
+                    // Read timestamp from first 8 bytes (BigInt64)
+                    const timestamp = Number(view.getBigInt64(0));
+                    latency = Date.now() - timestamp;
+                    // Rest is JPEG data
+                    const jpegData = new Uint8Array(buffer, 8);
+                    const blob = new Blob([jpegData], { type: 'image/jpeg' });
+                    const url = URL.createObjectURL(blob);
+                    renderFrameUrl(url);
+                    return;
+                }
+                
+                // JSON message (url, error, fullscreen_request)
                 const data = JSON.parse(e.data);
                 
                 if (data.type === 'frame') {
+                    // Legacy base64 frame support
                     renderFrame(data.data);
                     latency = Date.now() - data.timestamp;
                 } else if (data.type === 'url') {
@@ -782,7 +799,38 @@
             landingPage.style.display = 'flex';
         }
         
-        // Render a frame
+        // Render a frame from blob URL (binary)
+        let lastBlobUrl = null;
+        function renderFrameUrl(url) {
+            const img = new Image();
+            img.onload = () => {
+                // Revoke previous blob URL to prevent memory leak
+                if (lastBlobUrl) {
+                    URL.revokeObjectURL(lastBlobUrl);
+                }
+                lastBlobUrl = url;
+                
+                if (canvas.width !== img.width || canvas.height !== img.height) {
+                    canvas.width = img.width;
+                    canvas.height = img.height;
+                }
+                ctx.drawImage(img, 0, 0);
+                
+                frameCount++;
+                const now = Date.now();
+                if (now - lastFpsUpdate >= 1000) {
+                    fps = frameCount;
+                    frameCount = 0;
+                    lastFpsUpdate = now;
+                    statsEl.textContent = 'FPS: ' + fps + ' | Latency: ' + latency + 'ms';
+                }
+                
+                loadingOverlay.classList.add('hidden');
+            };
+            img.src = url;
+        }
+        
+        // Render a frame (legacy base64)
         function renderFrame(base64Data) {
             const img = new Image();
             img.onload = () => {
